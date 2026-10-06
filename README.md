@@ -5,6 +5,7 @@ Example applications built with the published Kuberic crates.
 ## Applications
 
 - [`kuberic-page`](kuberic-page/README.md) - a replicated in-memory page with a small HTTP read/write API.
+- [`kuberic-reliable-collections`](kuberic-reliable-collections/README.md) - reliable named dictionaries and a V2 runtime service adapter.
 - [`kuberic-rocksdb`](kuberic-rocksdb/README.md) - a RocksDB-backed replicated key/value state provider with typed batches, deterministic merge, retained operation history and exact-boundary copy.
 - [`rustfs-native`](rustfs-native/README.md) - a fixed-topology contract for a future RustFS native-replication integration.
 
