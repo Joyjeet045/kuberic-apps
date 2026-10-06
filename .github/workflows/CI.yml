@@ -20,6 +20,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Install RocksDB build prerequisites
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq clang libclang-dev
+
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
