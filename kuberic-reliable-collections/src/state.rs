@@ -24,6 +24,8 @@ pub const FORMAT: u32 = 2;
 pub const MAX_TRANSACTION_BYTES: usize = 1024 * 1024;
 pub const MAX_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024;
 pub const RETAINED_RESULTS: usize = 1024;
+const COMMITTED_PROGRESS_FILE: &str = "committed-progress";
+const MAX_COMMITTED_PROGRESS_BYTES: usize = 1024;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CommitVersion(pub i64);
@@ -67,6 +69,12 @@ pub(crate) struct Envelope {
     command: Vec<Change>,
 }
 
+#[derive(Serialize, Deserialize)]
+struct CommittedProgress {
+    format: u32,
+    committed_lsn: i64,
+}
+
 #[derive(Clone)]
 pub(crate) struct PreparedCommit {
     pub payload: Vec<u8>,
@@ -89,7 +97,10 @@ impl ReliableCollectionsState {
         let log = TransactionLog::open(path)?;
         let copy_root = log.root().join("copy");
         std::fs::create_dir_all(&copy_root)?;
-        let snapshot = recover(&log, log.last_lsn())?;
+        let mut snapshot = recover(&log, log.last_lsn())?;
+        if let Some(committed_lsn) = read_committed_lsn(log.root(), snapshot.applied_lsn)? {
+            snapshot.committed_lsn = snapshot.committed_lsn.max(committed_lsn);
+        }
         Ok(Self {
             inner: Mutex::new(Inner {
                 log,
@@ -201,6 +212,7 @@ impl ReliableCollectionsState {
             lsn: snapshot.applied_lsn,
             payload: bytes,
         })?;
+        write_committed_lsn(inner.log.root(), snapshot.committed_lsn)?;
         inner.snapshot = snapshot;
         inner.generation += 1;
         Ok(())
@@ -217,7 +229,8 @@ impl ReliableCollectionsState {
                 "copy boundary must be within committed progress".into(),
             ));
         }
-        let snapshot = recover(&inner.log, up_to_lsn)?;
+        let mut snapshot = recover(&inner.log, up_to_lsn)?;
+        snapshot.committed_lsn = up_to_lsn;
         encode_checked(&snapshot, MAX_SNAPSHOT_BYTES)
     }
 
@@ -241,8 +254,7 @@ impl ReliableCollectionsState {
             return Err(Error::Invalid("invalid committed progress".into()));
         }
         if committed_lsn > inner.snapshot.committed_lsn {
-            checkpoint_to(&mut inner, committed_lsn)?;
-            inner.snapshot.committed_lsn = committed_lsn;
+            update_committed_lsn(&mut inner, committed_lsn)?;
         }
         Ok(DurableApplicationProgress {
             applied_lsn: inner.snapshot.applied_lsn,
@@ -317,22 +329,7 @@ impl DurableState for ReliableCollectionsState {
             if from_lsn > to_lsn {
                 Vec::new()
             } else {
-                inner
-                    .log
-                    .records()
-                    .iter()
-                    .filter(|record| record.lsn >= from_lsn && record.lsn <= to_lsn)
-                    .map(|record| {
-                        let envelope: Envelope =
-                            decode_checked(&record.payload, MAX_TRANSACTION_BYTES)
-                                .map_err(Error::runtime)?;
-                        Ok(Operation {
-                            lsn: record.lsn,
-                            committed_lsn: envelope.confirmed_lsn,
-                            data: Bytes::copy_from_slice(&record.payload),
-                        })
-                    })
-                    .collect::<kuberic_runtime::Result<Vec<_>>>()?
+                retained_operations(&inner, from_lsn, to_lsn).map_err(Error::runtime)?
             }
         };
         Ok(Box::pin(stream::iter(operations.into_iter().map(Ok))))
@@ -408,16 +405,19 @@ impl ReliableCollectionsState {
             return Err(Error::Invalid("transaction LSN gap".into()));
         }
         let payload = operation.data.to_vec();
+        let previous_committed_lsn = inner.snapshot.committed_lsn;
         let mut snapshot = next_snapshot(&inner.snapshot, operation.lsn, &payload)?;
-        snapshot.committed_lsn = snapshot
-            .committed_lsn
-            .max(operation.committed_lsn.min(operation.lsn));
+        let committed_lsn = operation.committed_lsn.min(operation.lsn);
+        snapshot.committed_lsn = snapshot.committed_lsn.max(committed_lsn);
         checkpoint_if_needed(&mut inner, payload.len())?;
         inner.log.append(Record {
             lsn: operation.lsn,
             payload,
         })?;
         inner.snapshot = snapshot;
+        if committed_lsn > previous_committed_lsn {
+            write_committed_lsn(inner.log.root(), committed_lsn)?;
+        }
         Ok(DurableApplicationProgress {
             applied_lsn: inner.snapshot.applied_lsn,
             committed_lsn: inner.snapshot.committed_lsn,
@@ -522,6 +522,7 @@ impl ReliableCollectionsState {
             lsn: up_to_lsn,
             payload: bytes,
         })?;
+        write_committed_lsn(inner.log.root(), committed_lsn)?;
         snapshot.committed_lsn = committed_lsn;
         inner.snapshot = snapshot;
         inner.generation += 1;
@@ -677,6 +678,82 @@ fn recover(log: &TransactionLog, target: i64) -> Result<Snapshot> {
         snapshot = next_snapshot(&snapshot, record.lsn, &record.payload)?;
     }
     Ok(snapshot)
+}
+
+fn committed_progress_path(root: &Path) -> PathBuf {
+    root.join(COMMITTED_PROGRESS_FILE)
+}
+
+fn read_committed_lsn(root: &Path, applied_lsn: i64) -> Result<Option<i64>> {
+    let path = committed_progress_path(root);
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let progress: CommittedProgress = decode_checked(&bytes, MAX_COMMITTED_PROGRESS_BYTES)?;
+    if progress.format != FORMAT
+        || progress.committed_lsn < 0
+        || progress.committed_lsn > applied_lsn
+    {
+        return Err(Error::Invalid("invalid committed-progress record".into()));
+    }
+    Ok(Some(progress.committed_lsn))
+}
+
+fn write_committed_lsn(root: &Path, committed_lsn: i64) -> Result<()> {
+    atomic_write(
+        &committed_progress_path(root),
+        &encode_checked(
+            &CommittedProgress {
+                format: FORMAT,
+                committed_lsn,
+            },
+            MAX_COMMITTED_PROGRESS_BYTES,
+        )?,
+    )?;
+    Ok(())
+}
+
+fn update_committed_lsn(inner: &mut Inner, committed_lsn: i64) -> Result<()> {
+    write_committed_lsn(inner.log.root(), committed_lsn)?;
+    inner.snapshot.committed_lsn = committed_lsn;
+    Ok(())
+}
+
+fn retained_operations(inner: &Inner, from_lsn: i64, to_lsn: i64) -> Result<Vec<Operation>> {
+    let checkpoint_lsn = inner.log.checkpoint_record().map_or(0, |record| record.lsn);
+    if from_lsn <= checkpoint_lsn {
+        return Err(Error::Invalid(format!(
+            "replication range {from_lsn}..={to_lsn} predates retained checkpoint boundary {checkpoint_lsn}"
+        )));
+    }
+    if to_lsn > inner.snapshot.applied_lsn {
+        return Err(Error::Invalid(format!(
+            "replication range {from_lsn}..={to_lsn} exceeds applied progress {}",
+            inner.snapshot.applied_lsn
+        )));
+    }
+    let mut operations = Vec::new();
+    for expected in from_lsn..=to_lsn {
+        let record = inner
+            .log
+            .records()
+            .iter()
+            .find(|record| record.lsn == expected)
+            .ok_or_else(|| {
+                Error::Invalid(format!(
+                    "retained replication history has a gap at LSN {expected}"
+                ))
+            })?;
+        let envelope: Envelope = decode_checked(&record.payload, MAX_TRANSACTION_BYTES)?;
+        operations.push(Operation {
+            lsn: record.lsn,
+            committed_lsn: envelope.confirmed_lsn,
+            data: Bytes::copy_from_slice(&record.payload),
+        });
+    }
+    Ok(operations)
 }
 
 fn checkpoint_if_needed(inner: &mut Inner, additional: usize) -> Result<()> {

@@ -62,6 +62,11 @@ On a V2 primary, the envelope is passed once to `StateReplicator::replicate`.
 The stream consumer durably applies the operation before acknowledging it, so
 primary-side visibility happens only after the V2 replicator has completed local
 durable acceptance and quorum commit.
+Transactional reads on a primary use the locally applied durable image. During
+failover recovery that image may include records whose quorum confirmation is
+still in flight or adopted from an election-safe prefix. A successful commit,
+including a read-only commit, confirms the prefix observed by that transaction;
+plain reads do not by themselves advance the confirmed boundary.
 
 `TransactionId` supplies retry identity. The latest 1,024 outcomes are retained
 through restart, checkpoint, copy, and backup. Reusing a retained request ID or
@@ -83,10 +88,15 @@ reimplemented in the application layer.
 `StateProvider::get_copy_state(up_to_lsn)` returns deterministic bytes for a
 committed frozen boundary, including after restart. `finish_copy` installs a
 complete registry snapshot atomically and is idempotent for the same build and
-boundary. `checkpoint()` publishes the current committed prefix and retains any
-unconfirmed suffix. `backup()` writes a local atomic snapshot only when the
-applied and committed boundaries match. `restore_backup()` is allowed before a
-service attaches the manager to a running runtime.
+boundary. Committed progress is persisted as a small durable progress record on
+ordinary commits; it does not rewrite the full checkpoint or reclaim retained
+operations. A full checkpoint is published only by explicit `checkpoint()` or
+automatically when the next transaction would push retained log bytes beyond
+half of the 64 MiB retained-log budget. Checkpoint publication uses the current
+committed prefix and retains any unconfirmed suffix. `backup()` writes a local
+atomic snapshot only when the applied and committed boundaries match.
+`restore_backup()` is allowed before a service attaches the manager to a running
+runtime.
 
 ## Limits and scope
 

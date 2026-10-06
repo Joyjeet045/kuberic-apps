@@ -1,9 +1,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use kuberic_reliable_collections::{
     Error, ReliableCollectionsProvider, ReliableCollectionsState, StateManager, TransactionOptions,
+    log::TransactionLog,
 };
 use kuberic_runtime::StateProvider;
 use kuberic_runtime::application::{CopyChunk, OperationDataStream};
@@ -203,7 +204,42 @@ async fn transaction_context_admission_is_bounded_and_released() {
 }
 
 #[tokio::test]
-async fn checkpoint_restart_copy_backup_and_restore_are_deterministic() {
+async fn committed_progress_does_not_checkpoint_each_commit_and_recovers_after_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state");
+    let (state, manager) = open_manager(&path).await;
+    let values = manager
+        .get_or_add_dictionary::<String, i64>("values")
+        .await
+        .unwrap();
+    let mut last_version = 0;
+    for value in 0..20 {
+        let mut transaction = manager.create_transaction().await.unwrap();
+        values
+            .set(&mut transaction, &format!("key-{value}"), &value)
+            .unwrap();
+        last_version = transaction.commit().await.unwrap().0;
+    }
+    let progress = state.durable_progress().await.unwrap();
+    assert_eq!(progress.applied_lsn, last_version);
+    assert_eq!(progress.committed_lsn, last_version);
+    drop(manager);
+    drop(state);
+
+    let log = TransactionLog::open(path.clone()).unwrap();
+    assert!(log.checkpoint_record().is_none());
+    assert_eq!(log.records().len(), last_version as usize);
+    drop(log);
+
+    let (state, manager) = open_manager(&path).await;
+    let progress = state.durable_progress().await.unwrap();
+    assert_eq!(progress.applied_lsn, last_version);
+    assert_eq!(progress.committed_lsn, last_version);
+    assert_eq!(manager.applied_lsn().await.unwrap(), last_version);
+}
+
+#[tokio::test]
+async fn copy_state_retries_frozen_boundary_after_later_commits_and_restart() {
     let directory = tempfile::tempdir().unwrap();
     let source_path = directory.path().join("source");
     let (source_state, manager) = open_manager(&source_path).await;
@@ -216,24 +252,24 @@ async fn checkpoint_restart_copy_backup_and_restore_are_deterministic() {
     right.set(&mut create, &"balance".into(), &110).unwrap();
     let identity = create.id().clone();
     let version = create.commit().await.unwrap();
-    manager.checkpoint().await.unwrap();
-    drop(manager);
-    drop(source_state);
-
-    let (source_state, manager) = open_manager(&source_path).await;
     assert_eq!(
         manager.committed_result(identity.clone()).await.unwrap(),
         Some(version)
     );
     let provider = ReliableCollectionsProvider::new(source_state.clone());
     let first = copy_bytes(&provider, version.0).await;
+    let mut later = manager.create_transaction().await.unwrap();
+    left.set(&mut later, &"after-boundary".into(), &1).unwrap();
+    later.commit().await.unwrap();
+    let second = copy_bytes(&provider, version.0).await;
+    assert_eq!(first, second);
     drop(provider);
     drop(manager);
     drop(source_state);
     let reopened = Arc::new(ReliableCollectionsState::open(source_path.clone()).unwrap());
     let provider = ReliableCollectionsProvider::new(reopened);
-    let second = copy_bytes(&provider, version.0).await;
-    assert_eq!(first, second);
+    let restarted = copy_bytes(&provider, version.0).await;
+    assert_eq!(first, restarted);
     drop(provider);
     let (_, manager) = open_manager(&source_path).await;
 
@@ -272,6 +308,50 @@ async fn checkpoint_restart_copy_backup_and_restore_are_deterministic() {
     assert_eq!(
         restored_read.provider_names().unwrap(),
         vec!["left", "right"]
+    );
+}
+
+#[tokio::test]
+async fn retained_replication_ranges_are_contiguous_and_fail_closed_after_checkpoint() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state");
+    let (state, manager) = open_manager(&path).await;
+    let values = manager
+        .get_or_add_dictionary::<String, i64>("values")
+        .await
+        .unwrap();
+    let mut last_version = 0;
+    for value in 0..5 {
+        let mut transaction = manager.create_transaction().await.unwrap();
+        values
+            .set(&mut transaction, &format!("key-{value}"), &value)
+            .unwrap();
+        last_version = transaction.commit().await.unwrap().0;
+    }
+    let operations = state
+        .get_replication_operations(2, last_version)
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(
+        operations
+            .iter()
+            .map(|operation| operation.lsn)
+            .collect::<Vec<_>>(),
+        (2..=last_version).collect::<Vec<_>>()
+    );
+
+    manager.checkpoint().await.unwrap();
+    let Err(error) = state.get_replication_operations(1, 1).await else {
+        panic!("expected retained replication range to fail after checkpoint");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("predates retained checkpoint boundary"),
+        "{error}"
     );
 }
 
