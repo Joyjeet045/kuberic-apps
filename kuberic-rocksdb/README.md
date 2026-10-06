@@ -40,11 +40,13 @@ The adapter uses the default column family only, bytewise keys, no compression a
 
 ## Copy, exact boundaries and restart
 
-V2 freezes copy at a committed LSN boundary and sends operations above that boundary as retained catch-up. `RocksState` reconstructs the exact requested boundary from current RocksDB user values plus persisted undo history, encodes the deterministic snapshot as bounded chunks, and produces identical bytes for the same boundary across repeated calls and restarts.
+V2 freezes copy at a committed LSN boundary and sends operations above that boundary as retained catch-up. `RocksState` reconstructs the exact requested boundary from current RocksDB user values plus persisted undo history, encodes the deterministic snapshot as a bounded in-memory logical snapshot before chunking it, and produces identical bytes for the same boundary across repeated calls and restarts. The encoded snapshot is capped by `MAX_COPY` (256 MiB).
 
 On the target, copy chunks are staged durably under the build ID. Exact retries verify identical bytes. `finish_copy` validates the version, checksum, profile and LSN, creates a new RocksDB generation from the copied snapshot, syncs it, and atomically publishes the active-generation pointer. Retrying `finish_copy` with the same staged bytes returns the same durable progress.
 
 The V1 epoch-rollback callback is not carried forward as application rollback. In V2, the runtime engine owns authority fencing, verified prefixes and retained catch-up. The RocksDB adapter persists monotonic epoch observation but keeps applied operations and committed progress separate, allowing the engine to select the committed boundary without application-side tail deletion.
+
+Undo records and retained operation history are not pruned automatically. Operators must provision capacity for disk growth until an external retention policy is added.
 
 ## Limits and supported configuration
 
