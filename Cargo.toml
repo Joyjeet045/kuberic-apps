@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["kuberic-page"]
+members = ["kuberic-page", "rustfs-native"]
 
 [workspace.package]
 version = "0.1.0"

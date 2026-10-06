@@ -5,6 +5,7 @@ Example applications built with the published Kuberic crates.
 ## Applications
 
 - [`kuberic-page`](kuberic-page/README.md) - a replicated in-memory page with a small HTTP read/write API.
+- [`rustfs-native`](rustfs-native/README.md) - a fixed-topology contract for a future RustFS native-replication integration.
 
 ## Build and test
 
