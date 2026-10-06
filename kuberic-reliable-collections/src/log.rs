@@ -3,6 +3,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 const MAGIC: &[u8; 4] = b"KRC1";
+const FROZEN_COPY_PREFIX: &str = "frozen-copy-";
 pub const MAX_RECORD: usize = 64 * 1024 * 1024;
 pub const MAX_RETAINED_LOG: u64 = 64 * 1024 * 1024;
 
@@ -166,6 +167,14 @@ impl TransactionLog {
         &self.root
     }
 
+    pub(crate) fn generation_path(&self) -> &Path {
+        &self.generation
+    }
+
+    pub(crate) fn frozen_copy_path(&self, lsn: i64) -> PathBuf {
+        self.generation.join(format!("{FROZEN_COPY_PREFIX}{lsn}"))
+    }
+
     pub fn checkpoint_record(&self) -> Option<&Record> {
         self.checkpoint.as_ref()
     }
@@ -242,14 +251,19 @@ impl TransactionLog {
             .filter(|record| record.lsn > snapshot.lsn)
             .cloned()
             .collect();
-        self.publish_generation(snapshot, suffix)
+        self.publish_generation(snapshot, suffix, true)
     }
 
     pub fn install_checkpoint(&mut self, snapshot: Record) -> io::Result<()> {
-        self.publish_generation(snapshot, Vec::new())
+        self.publish_generation(snapshot, Vec::new(), false)
     }
 
-    fn publish_generation(&mut self, snapshot: Record, suffix: Vec<Record>) -> io::Result<()> {
+    fn publish_generation(
+        &mut self,
+        snapshot: Record,
+        suffix: Vec<Record>,
+        retain_frozen_copies: bool,
+    ) -> io::Result<()> {
         let bytes = encode(&snapshot)?;
         let temporary = tempfile::Builder::new()
             .prefix("generation-")
@@ -264,6 +278,24 @@ impl TransactionLog {
             file.write_all(&encode(record)?)?;
         }
         file.sync_all()?;
+        if retain_frozen_copies {
+            for entry in std::fs::read_dir(&self.generation)? {
+                let entry = entry?;
+                if entry.file_type()?.is_file()
+                    && entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(FROZEN_COPY_PREFIX)
+                {
+                    let destination = temporary.path().join(entry.file_name());
+                    std::fs::copy(entry.path(), &destination)?;
+                    OpenOptions::new()
+                        .write(true)
+                        .open(destination)?
+                        .sync_all()?;
+                }
+            }
+        }
         #[cfg(unix)]
         File::open(temporary.path())?.sync_all()?;
         let generation = temporary.keep();

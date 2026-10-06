@@ -59,9 +59,9 @@ new transaction.
 
 Each commit, including read-only commits, is serialized as one checked envelope.
 On a V2 primary, the envelope is passed once to `StateReplicator::replicate`.
-The stream consumer durably applies the operation before acknowledging it, so
-primary-side visibility happens only after the V2 replicator has completed local
-durable acceptance and quorum commit.
+The V2 engine durably applies primary writes locally before quorum completion;
+secondary stream consumers persist before acknowledging. A successful commit
+response requires local durable acceptance and quorum commit.
 Transactional reads on a primary use the locally applied durable image. During
 failover recovery that image may include records whose quorum confirmation is
 still in flight or adopted from an election-safe prefix. A successful commit,
@@ -86,11 +86,17 @@ and retained catch-up delivery; the V1 epoch rollback callback is therefore not
 reimplemented in the application layer.
 
 `StateProvider::get_copy_state(up_to_lsn)` returns deterministic bytes for a
-committed frozen boundary, including after restart. `finish_copy` installs a
+committed frozen boundary, including after checkpointing and restart. Requested
+copy snapshots are persisted and carried into subsequent checkpoint generations;
+they are not automatically pruned, so provision disk for retained copy snapshots.
+Installing a new copy starts a new snapshot history rather than reusing cached
+bytes from the replaced state. `finish_copy` installs a
 complete registry snapshot atomically and is idempotent for the same build and
-boundary. Committed progress is persisted as a small durable progress record on
+boundary. Committed progress is persisted as a small, generation-local durable progress record on
 ordinary commits; it does not rewrite the full checkpoint or reclaim retained
-operations. A full checkpoint is published only by explicit `checkpoint()` or
+operations. A newly installed generation cannot inherit a previous generation's
+commit watermark, including a crash immediately after publication.
+A full checkpoint is published only by explicit `checkpoint()` or
 automatically when the next transaction would push retained log bytes beyond
 half of the 64 MiB retained-log budget. Checkpoint publication uses the current
 committed prefix and retains any unconfirmed suffix. `backup()` writes a local

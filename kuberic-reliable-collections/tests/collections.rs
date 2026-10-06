@@ -263,6 +263,8 @@ async fn copy_state_retries_frozen_boundary_after_later_commits_and_restart() {
     later.commit().await.unwrap();
     let second = copy_bytes(&provider, version.0).await;
     assert_eq!(first, second);
+    manager.checkpoint().await.unwrap();
+    assert_eq!(first, copy_bytes(&provider, version.0).await);
     drop(provider);
     drop(manager);
     drop(source_state);
@@ -353,6 +355,40 @@ async fn retained_replication_ranges_are_contiguous_and_fail_closed_after_checkp
             .contains("predates retained checkpoint boundary"),
         "{error}"
     );
+}
+
+#[tokio::test]
+async fn copy_publication_cannot_recover_a_previous_generations_commit_watermark() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state");
+    let (state, manager) = open_manager(&path).await;
+    let values = manager
+        .get_or_add_dictionary::<String, i64>("values")
+        .await
+        .unwrap();
+    let boundary = state.durable_progress().await.unwrap().committed_lsn;
+    let provider = ReliableCollectionsProvider::new(state.clone());
+    let snapshot = copy_bytes(&provider, boundary).await;
+    let mut transaction = manager.create_transaction().await.unwrap();
+    values.set(&mut transaction, &"later".into(), &42).unwrap();
+    transaction.commit().await.unwrap();
+    drop(provider);
+    drop(manager);
+    drop(state);
+
+    let mut log = TransactionLog::open(path.clone()).unwrap();
+    log.install_checkpoint(kuberic_reliable_collections::log::Record {
+        lsn: boundary,
+        payload: snapshot,
+    })
+    .unwrap();
+    drop(log);
+
+    // Reopen at the crash cut after generation publication, before any later metadata write.
+    let state = ReliableCollectionsState::open(path).unwrap();
+    let progress = state.durable_progress().await.unwrap();
+    assert_eq!(progress.applied_lsn, boundary);
+    assert_eq!(progress.committed_lsn, boundary);
 }
 
 async fn copy_bytes(provider: &ReliableCollectionsProvider, up_to_lsn: i64) -> Vec<u8> {
