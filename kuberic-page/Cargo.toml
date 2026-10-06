@@ -1,0 +1,25 @@
+[package]
+name = "kuberic-page"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "A one-page replicated Kuberic application"
+repository.workspace = true
+readme = "README.md"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+bytes.workspace = true
+clap.workspace = true
+futures.workspace = true
+kuberic-runtime.workspace = true
+tokio.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+kuberic-runtime = { workspace = true, features = ["testing"] }
+tempfile.workspace = true
+tower.workspace = true
