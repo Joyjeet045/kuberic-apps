@@ -98,7 +98,9 @@ impl ReliableCollectionsState {
         let copy_root = log.root().join("copy");
         std::fs::create_dir_all(&copy_root)?;
         let mut snapshot = recover(&log, log.last_lsn())?;
-        if let Some(committed_lsn) = read_committed_lsn(log.root(), snapshot.applied_lsn)? {
+        if let Some(committed_lsn) =
+            read_committed_lsn(log.generation_path(), snapshot.applied_lsn)?
+        {
             snapshot.committed_lsn = snapshot.committed_lsn.max(committed_lsn);
         }
         Ok(Self {
@@ -212,7 +214,7 @@ impl ReliableCollectionsState {
             lsn: snapshot.applied_lsn,
             payload: bytes,
         })?;
-        write_committed_lsn(inner.log.root(), snapshot.committed_lsn)?;
+        write_committed_lsn(inner.log.generation_path(), snapshot.committed_lsn)?;
         inner.snapshot = snapshot;
         inner.generation += 1;
         Ok(())
@@ -229,9 +231,27 @@ impl ReliableCollectionsState {
                 "copy boundary must be within committed progress".into(),
             ));
         }
+        let path = inner.log.frozen_copy_path(up_to_lsn);
+        match std::fs::metadata(&path) {
+            Ok(metadata) => {
+                if metadata.len() > (MAX_SNAPSHOT_BYTES + 32) as u64 {
+                    return Err(Error::ResourceExhausted);
+                }
+                let bytes = std::fs::read(path)?;
+                let snapshot = checked_snapshot(&bytes)?;
+                if snapshot.applied_lsn != up_to_lsn || snapshot.committed_lsn != up_to_lsn {
+                    return Err(Error::Invalid("frozen copy boundary mismatch".into()));
+                }
+                return Ok(bytes);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         let mut snapshot = recover(&inner.log, up_to_lsn)?;
         snapshot.committed_lsn = up_to_lsn;
-        encode_checked(&snapshot, MAX_SNAPSHOT_BYTES)
+        let bytes = encode_checked(&snapshot, MAX_SNAPSHOT_BYTES)?;
+        atomic_write(&path, &bytes)?;
+        Ok(bytes)
     }
 
     pub(crate) fn update_epoch(&self, previous_epoch_last_lsn: i64) -> Result<()> {
@@ -416,7 +436,7 @@ impl ReliableCollectionsState {
         })?;
         inner.snapshot = snapshot;
         if committed_lsn > previous_committed_lsn {
-            write_committed_lsn(inner.log.root(), committed_lsn)?;
+            write_committed_lsn(inner.log.generation_path(), committed_lsn)?;
         }
         Ok(DurableApplicationProgress {
             applied_lsn: inner.snapshot.applied_lsn,
@@ -522,7 +542,7 @@ impl ReliableCollectionsState {
             lsn: up_to_lsn,
             payload: bytes,
         })?;
-        write_committed_lsn(inner.log.root(), committed_lsn)?;
+        write_committed_lsn(inner.log.generation_path(), committed_lsn)?;
         snapshot.committed_lsn = committed_lsn;
         inner.snapshot = snapshot;
         inner.generation += 1;
