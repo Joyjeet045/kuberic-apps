@@ -1,0 +1,30 @@
+[package]
+name = "kuberic-rocksdb"
+version.workspace = true
+edition.workspace = true
+rust-version = "1.88"
+license.workspace = true
+description = "Checkpoint-backed RocksDB application for the Kuberic runtime"
+repository.workspace = true
+readme = "README.md"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+bytes.workspace = true
+clap.workspace = true
+crc32fast.workspace = true
+futures.workspace = true
+kuberic-runtime.workspace = true
+rocksdb.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+kuberic-runtime = { workspace = true, features = ["testing"] }
+tower.workspace = true
