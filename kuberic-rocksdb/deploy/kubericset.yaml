@@ -1,0 +1,8 @@
+apiVersion: operator.kuberic.io/v1alpha1
+kind: KubericSet
+metadata:
+  name: rocksdb
+spec:
+  replicas: 3
+  image: localhost/kuberic-rocksdb:dev
+  failoverDelaySeconds: 10
