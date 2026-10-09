@@ -1,6 +1,6 @@
 # kuberic-rocksdb
 
-An experimental, single-primary RocksDB application using the published Kuberic
+An experimental, single-primary RocksDB application using a commit-pinned Kuberic
 runtime, following the [page application's](../kuberic-page/README.md) host/API
 pattern. Application-specific storage stays in this repository; no private
 framework APIs or path dependencies are used in production.
@@ -22,13 +22,10 @@ If libclang is not discoverable, point `LIBCLANG_PATH` at the LLVM binary
 directory. A standalone libclang DLL also needs the matching Clang resource
 headers; set `BINDGEN_EXTRA_CLANG_ARGS` to `-I"<resource-headers-directory>"`.
 
-The dependency is `kuberic-runtime =0.0.1`, the latest published runtime when
-this application was added. CI independently validates the current framework
-main branch using a Cargo patch without changing the application's manifest.
-For an equivalent local compatibility run, supply
-`--config "patch.crates-io.kuberic-runtime.path='<framework-runtime-path>'"`
-before Cargo's `test` subcommand. Run Cargo again without the override to return
-the generated lockfile to the published dependency.
+The workspace uses `kuberic-runtime` from `https://github.com/youyuanwu/kuberic`,
+pinned to commit `131ccc9ddd7dbba9fb910d1000d4fbd2206c548a`, the framework revision
+used for the validation below. CI and local builds use the same Git dependency
+and committed lockfile; no separate framework checkout or Cargo patch is needed.
 
 ## HTTP API
 

@@ -16,7 +16,7 @@ axum = "0.8"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 futures = "0.3"
-kuberic-runtime = "=0.0.1"
+kuberic-runtime = { git = "https://github.com/youyuanwu/kuberic", rev = "131ccc9ddd7dbba9fb910d1000d4fbd2206c548a" }
 crc32fast = "1"
 rocksdb = { version = "=0.25.0", default-features = false, features = ["bindgen-runtime"] }
 serde = { version = "1", features = ["derive"] }

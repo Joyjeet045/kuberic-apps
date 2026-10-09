@@ -17,27 +17,10 @@ jobs:
   build-and-test:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        runtime: [published, main]
     env:
       CARGO_BUILD_JOBS: 2
     steps:
       - uses: actions/checkout@v7
-
-      - name: Check out current framework
-        if: matrix.runtime == 'main'
-        uses: actions/checkout@v7
-        with:
-          repository: youyuanwu/kuberic
-          path: framework
-
-      - name: Select current framework runtime
-        if: matrix.runtime == 'main'
-        run: |
-          mkdir -p "$HOME/.cargo"
-          printf '\n[patch.crates-io]\nkuberic-runtime = { path = "%s/framework/kuberic-runtime" }\n' "$GITHUB_WORKSPACE" >> "$HOME/.cargo/config.toml"
 
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v2

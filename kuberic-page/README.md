@@ -1,6 +1,6 @@
 # kuberic-page
 
-`kuberic-page` is a minimal Kuberic application with one logical key: the page. It uses the default replicator from the published `kuberic-runtime` crate and keeps the application value in process memory.
+`kuberic-page` is a minimal Kuberic application with one logical key: the page. It uses the default replicator from the workspace's commit-pinned `kuberic-runtime` Git dependency and keeps the application value in process memory.
 
 ## HTTP API
 

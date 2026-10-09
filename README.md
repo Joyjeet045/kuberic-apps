@@ -1,6 +1,6 @@
 # Kuberic Apps
 
-Example applications built with the published Kuberic crates.
+Example applications built with a commit-pinned Kuberic runtime.
 
 ## Applications
 
@@ -20,6 +20,7 @@ cargo build --workspace
 cargo test --workspace --all-features
 ```
 
-Applications use the published `kuberic-runtime =0.0.1` public APIs. CI also tests
-the workspace against the framework's current main branch. The applications and
-framework remain experimental, not production-ready.
+Applications use the public APIs of `kuberic-runtime`, pinned to framework commit
+`131ccc9ddd7dbba9fb910d1000d4fbd2206c548a` through a Git dependency. CI tests
+the same pinned revision. The applications and framework remain experimental,
+not production-ready.
