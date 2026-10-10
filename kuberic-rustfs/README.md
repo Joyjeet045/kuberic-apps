@@ -390,10 +390,16 @@ docker build --file .\kuberic-rustfs\Dockerfile --tag kuberic-rustfs:local .
 
 The harness checks distinct one-MiB object hashes, authenticated control,
 enforced native/control network isolation, lease expiry, unsafe topology and
-conflicting-ID rejection, read/write quorum differences, process and same-PVC
+conflicting-ID rejection, native read/write health and S3 quorum outcomes, process and same-PVC
 Pod recovery, stale authority rejection, appended pools, interrupted native
 decommission with measured movement, durable receipts, and worker rejoin.
 It fails if it cannot observe actual in-progress movement before interruption.
+Quorum fault injection temporarily stops StatefulSet Pods while retaining the
+four-endpoint native configuration and PVCs, then restores all participants.
+This is a temporary outage test, not a supported topology scale-down operation.
+Native cluster read health includes lock and IAM readiness in addition to erasure
+read quorum. The test compares the adapter's read signal with the native endpoint
+instead of assuming that half the drives always produce HTTP 200.
 It cleans up only its own cluster, port-forwards, and temporary files. The CI
 workflow exposes the same suite through the opt-in `rustfs_e2e` dispatch input.
 

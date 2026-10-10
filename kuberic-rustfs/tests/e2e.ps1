@@ -71,6 +71,7 @@ function Forward([string]$Pod) {
         if ($entry.Process.HasExited) { throw (Get-Content "$log.err" -Raw) }
         if (-not (Test-Path $log)) { return $false }
         $text = Get-Content $log -Raw
+        if (-not $text) { return $false }
         foreach ($port in @{ Native = 9000; Client = 9002; Control = 9003 }.GetEnumerator()) {
             if ($text -notmatch "Forwarding from 127\.0\.0\.1:(\d+) -> $($port.Value)") { return $false }
             $entry[$port.Key] = [int]$Matches[1]
@@ -262,25 +263,33 @@ nodes:
     Inventory "rfs-a-0"
     $stale = @{ incarnation = (Observe "rfs-a-0").incarnation; revision = 1; enabled = $true; lease_millis = 10000 }
     Expect-Status (Http $forwards["rfs-a-0"].Control "/v1/native/authority" "POST" ($stale | ConvertTo-Json -Compress) -Control) 409
-    $stopped = @{}
-    foreach ($pod in @("rfs-a-2", "rfs-a-3")) {
-        $stopped[$pod] = Native-Pid $pod
-        Signal-Native $pod $stopped[$pod] "STOP"
-    }
-    Wait-For "native read quorum survives write quorum loss" {
+    K @("scale", "statefulset/rfs-a", "--replicas=2") | Write-Host
+    K @("wait", "--for=delete", "pod/rfs-a-2", "pod/rfs-a-3", "--timeout=90s") | Write-Host
+    Wait-For "native write quorum loss is observed" {
         $o = Observe "rfs-a-0"
-        $o.health.state -eq "observed" -and $o.health.health.readable -and -not $o.health.health.writable
+        $o.health.state -eq "observed" -and -not $o.health.health.writable
     } 90
+    $nativeRead = Http $forwards["rfs-a-0"].Native "/minio/health/cluster/read"
+    if ($nativeRead.Status -notin @(200, 503)) { throw "Native read health returned $($nativeRead.Status): $($nativeRead.Text)" }
+    $observed = Observe "rfs-a-0"
+    if ($observed.health.state -ne "observed" -or $observed.health.health.readable -ne ($nativeRead.Status -eq 200)) {
+        throw "Adapter read health differs from the native verdict: $($observed | ConvertTo-Json -Depth 10 -Compress)"
+    }
     Expect-Status (Http $forwards["rfs-a-0"].Client "/inventory/object-0" -Signed) 200
     Expect-Status (Http $forwards["rfs-a-0"].Client "/inventory/uncommitted" "PUT" -File $payloadFile -Signed) 503
-    $stopped["rfs-a-1"] = Native-Pid "rfs-a-1"
-    Signal-Native "rfs-a-1" $stopped["rfs-a-1"] "STOP"
+    K @("scale", "statefulset/rfs-a", "--replicas=1") | Write-Host
+    K @("wait", "--for=delete", "pod/rfs-a-1", "--timeout=90s") | Write-Host
     Wait-For "native read quorum loss is not reported healthy" {
         $o = Observe "rfs-a-0"
         $o.health.state -eq "observed" -and -not $o.health.health.readable -and -not $o.health.health.writable
     } 90
     Expect-Status (Http $forwards["rfs-a-0"].Client "/inventory/object-0" -Signed) 503
-    foreach ($pod in $stopped.Keys) { Signal-Native $pod $stopped[$pod] "CONT" }
+    K @("scale", "statefulset/rfs-a", "--replicas=4") | Write-Host
+    Wait-For "all quorum participants return" {
+        @((K @("get", "pods", "-l", "rustfs-pool=a", "-o", "json") | ConvertFrom-Json).items).Count -eq 4
+    }
+    K @("wait", "--for=condition=Ready", "pod", "-l", "rustfs-pool=a", "--timeout=240s") | Write-Host
+    foreach ($pod in @("rfs-a-1", "rfs-a-2", "rfs-a-3")) { $null = Forward $pod }
     Wait-For "native quorum restored" {
         $o = Observe "rfs-a-0"
         $o.health.state -eq "observed" -and $o.health.health.writable
