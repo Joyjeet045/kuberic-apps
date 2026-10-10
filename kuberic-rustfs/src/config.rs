@@ -57,7 +57,8 @@ pub(crate) fn hex_digest(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CredentialFiles {
     pub access_key: PathBuf,
     pub secret_key: PathBuf,

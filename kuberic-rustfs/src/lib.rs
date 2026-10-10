@@ -20,8 +20,13 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail, ensure};
 use reqwest::{Client, StatusCode, Url, redirect::Policy};
 
+pub mod adapter;
+mod admin;
 mod config;
+pub mod controller;
+mod journal;
 mod process;
+pub mod server;
 mod topology;
 
 pub use config::{BinaryPin, CredentialFiles, LaunchConfig};

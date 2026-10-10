@@ -12,6 +12,8 @@ const MAX_RECORD_BYTES: usize = 64 * 1024;
 const RECORD: &str = "topology.json";
 const LOCK: &str = "owner.lock";
 const ACTIVE: &str = "process-active";
+#[cfg(target_os = "linux")]
+const INHERITED_LOCK: &[u8] = b"kuberic-rustfs-inherited-flock-v1\n";
 
 /// Ordered RustFS pool arguments. Changing an established layout is not a restart.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -185,7 +187,7 @@ struct Record {
 
 pub(crate) struct TopologyLease {
     directory: PathBuf,
-    _lock: File,
+    lock: File,
 }
 
 impl TopologyLease {
@@ -215,10 +217,15 @@ impl TopologyLease {
             .open(lock_path)?;
         fs2::FileExt::try_lock_exclusive(&lock)
             .context("RustFS state directory is already owned")?;
-        let lease = Self {
-            directory,
-            _lock: lock,
-        };
+        let lease = Self { directory, lock };
+        #[cfg(target_os = "linux")]
+        if lease.directory.join(ACTIVE).try_exists()?
+            && fs::symlink_metadata(lease.directory.join(ACTIVE))?.is_file()
+            && fs::metadata(lease.directory.join(ACTIVE))?.len() == INHERITED_LOCK.len() as u64
+            && fs::read(lease.directory.join(ACTIVE))? == INHERITED_LOCK
+        {
+            lease.finish_process()?;
+        }
         ensure!(
             !lease.directory.join(ACTIVE).try_exists()?,
             "unclean RustFS process ownership: resolve the previous process before reopening"
@@ -275,11 +282,31 @@ impl TopologyLease {
             .write(true)
             .create_new(true)
             .open(self.directory.join(ACTIVE))?;
+        #[cfg(target_os = "linux")]
+        file.write_all(INHERITED_LOCK)?;
+        #[cfg(not(target_os = "linux"))]
         file.write_all(
             b"Process launch or ownership may be unresolved. Do not automatically clear.\n",
         )?;
         file.sync_all()?;
         sync_directory(&self.directory)
+    }
+
+    pub(crate) fn inherit_lock(&self, command: &mut std::process::Command) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::process::CommandExt;
+            let lock = self.lock.try_clone()?;
+            unsafe {
+                command.pre_exec(move || {
+                    rustix::io::fcntl_setfd(&lock, rustix::io::FdFlags::empty())
+                        .map_err(std::io::Error::from)
+                });
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (&self.lock, command);
+        Ok(())
     }
 
     /// Only call after spawn failed or the owned child was conclusively reaped.
@@ -288,6 +315,92 @@ impl TopologyLease {
             .context("clearing confirmed RustFS process ownership")?;
         sync_directory(&self.directory)
     }
+}
+
+pub(crate) fn recorded_topology(directory: &Path) -> Result<Option<Topology>> {
+    let path = directory.join(RECORD);
+    if !path.try_exists()? {
+        return Ok(None);
+    }
+    let metadata = fs::symlink_metadata(&path)?;
+    ensure!(
+        metadata.is_file() && metadata.len() <= MAX_RECORD_BYTES as u64,
+        "invalid RustFS topology record"
+    );
+    let record: Record = serde_json::from_slice(&fs::read(path)?)?;
+    ensure!(record.schema_version == 1, "unsupported topology schema");
+    Ok(Some(record.topology))
+}
+
+pub(crate) fn validate_expansion(previous: &Topology, target: &Topology) -> Result<()> {
+    previous.local_volumes()?;
+    target.local_volumes()?;
+    ensure!(
+        target.pools.len() > previous.pools.len()
+            && target.pools.starts_with(&previous.pools)
+            && target.local_node == previous.local_node
+            && target.erasure_set_drive_count == previous.erasure_set_drive_count,
+        "expansion must append complete pools without changing existing pool identity"
+    );
+    Ok(())
+}
+
+pub(crate) fn prepare_expansion(directory: &Path, target: &Topology) -> Result<()> {
+    let previous =
+        recorded_topology(directory)?.context("expansion requires established storage")?;
+    if previous == *target {
+        TopologyLease::acquire(directory, target)?;
+        return Ok(());
+    }
+    validate_expansion(&previous, target)?;
+    let lease = TopologyLease::acquire(directory, &previous)?;
+    let volumes = expansion_volumes(&lease.directory, &previous, target)?;
+    let record = Record {
+        schema_version: 1,
+        topology: target.clone(),
+        local_volumes: volumes,
+    };
+    let bytes = serde_json::to_vec_pretty(&record)?;
+    ensure!(
+        bytes.len() <= MAX_RECORD_BYTES,
+        "topology record exceeds 64 KiB"
+    );
+    let mut temporary = tempfile::NamedTempFile::new_in(&lease.directory)?;
+    temporary.write_all(&bytes)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(lease.directory.join(RECORD))?;
+    sync_directory(&lease.directory)
+}
+
+pub(crate) fn expansion_volumes(
+    directory: &Path,
+    previous: &Topology,
+    target: &Topology,
+) -> Result<Vec<PathBuf>> {
+    validate_expansion(previous, target)?;
+    let directory = existing_directory(directory)?;
+    let old = previous
+        .local_volumes()?
+        .iter()
+        .map(|path| existing_directory(path))
+        .collect::<Result<Vec<_>>>()?;
+    let mut volumes: Vec<PathBuf> = Vec::new();
+    for path in target.local_volumes()? {
+        let path = existing_directory(&path)?;
+        ensure!(
+            !overlaps(&directory, &path) && !volumes.iter().any(|other| overlaps(other, &path)),
+            "RustFS state and volume directories must be disjoint"
+        );
+        if !old.contains(&path) {
+            ensure!(
+                fs::read_dir(&path)?.next().transpose()?.is_none(),
+                "new pool volumes must be empty"
+            );
+        }
+        volumes.push(path);
+    }
+    ensure!(volumes.starts_with(&old), "existing volumes cannot change");
+    Ok(volumes)
 }
 
 fn existing_directory(path: &Path) -> Result<PathBuf> {
@@ -362,6 +475,7 @@ mod tests {
         fs::remove_file(sentinel).unwrap();
         let lease = TopologyLease::acquire(&directory, &topology).unwrap();
         lease.begin_process().unwrap();
+        fs::write(directory.join(ACTIVE), b"unresolved legacy owner").unwrap();
         drop(lease);
         assert!(TopologyLease::acquire(&directory, &topology).is_err());
         assert!(directory.join(ACTIVE).exists());
@@ -405,5 +519,36 @@ mod tests {
         topology.erasure_set_drive_count = None;
         assert!(TopologyLease::acquire(&directory, &topology).is_err());
         assert!(!root.path().join("missing").exists());
+    }
+
+    #[test]
+    fn expansion_is_append_only_empty_and_durable() {
+        let root = tempfile::tempdir().unwrap();
+        let previous = setup(root.path());
+        let directory = root.path().join("state");
+        drop(TopologyLease::acquire(&directory, &previous).unwrap());
+        let original = fs::read(directory.join(RECORD)).unwrap();
+        fs::create_dir(root.path().join("next1")).unwrap();
+        fs::create_dir(root.path().join("next2")).unwrap();
+        let mut target = previous.clone();
+        target
+            .pools
+            .push(format!("{}{{1...2}}", root.path().join("next").display()));
+        fs::write(root.path().join("next1").join("foreign"), "do not adopt").unwrap();
+        assert!(prepare_expansion(&directory, &target).is_err());
+        assert_eq!(fs::read(directory.join(RECORD)).unwrap(), original);
+        fs::remove_file(root.path().join("next1").join("foreign")).unwrap();
+        let mut reordered = target.clone();
+        reordered.pools.reverse();
+        assert!(prepare_expansion(&directory, &reordered).is_err());
+        let lease = TopologyLease::acquire(&directory, &previous).unwrap();
+        assert!(prepare_expansion(&directory, &target).is_err());
+        drop(lease);
+        prepare_expansion(&directory, &target).unwrap();
+        assert_eq!(recorded_topology(&directory).unwrap(), Some(target.clone()));
+        prepare_expansion(&directory, &target).unwrap();
+        assert!(TopologyLease::acquire(&directory, &previous).is_err());
+        assert!(prepare_expansion(&directory, &previous).is_err());
+        assert!(TopologyLease::acquire(&directory, &target).is_ok());
     }
 }

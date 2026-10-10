@@ -2,25 +2,32 @@
 name = "kuberic-rustfs"
 version.workspace = true
 edition.workspace = true
-rust-version = "1.88"
+rust-version = "1.95"
 license.workspace = true
-description = "Native health, process lifecycle, and topology for the RustFS Kuberic example"
+description = "Native RustFS lifecycle, health, access fencing, and topology integration for Kuberic"
 repository.workspace = true
 readme = "README.md"
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
+aws-credential-types = "1"
+aws-sigv4 = "1"
+axum.workspace = true
 fs2.workspace = true
-reqwest.workspace = true
+kuberic-native-runtime.workspace = true
+kuberic-controller.workspace = true
+reqwest = { workspace = true, features = ["json"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+subtle = "2"
 
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1", features = ["process"] }
-
-[dev-dependencies]
-axum.workspace = true
+rustix = { version = "1", features = ["process", "fs"] }

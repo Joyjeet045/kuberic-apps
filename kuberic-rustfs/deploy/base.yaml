@@ -1,0 +1,290 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: rustfs-example
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rustfs-node-a
+  namespace: rustfs-example
+data:
+  node.json: |
+    {
+      "binary": "/usr/local/bin/rustfs",
+      "sha256": "e6544a42a09a16d6fea47ad3d8aaa1a8793c9afa9c723bb8ae884f1238cd7c25",
+      "credentials": {
+        "access_key": "/credentials/access-key",
+        "secret_key": "/credentials/secret-key"
+      },
+      "state_directory": "/storage/adapter",
+      "topology": {
+        "pools": ["http://rfs-a-{0...3}.rustfs-internal:9000/storage/data"],
+        "local_node": null,
+        "erasure_set_drive_count": 4
+      },
+      "native_address": "0.0.0.0:9000",
+      "client_address": "0.0.0.0:9002",
+      "control_address": "0.0.0.0:9003",
+      "control_token_file": "/credentials/control-token",
+      "shutdown_grace_seconds": 10
+    }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rustfs-controller
+  namespace: rustfs-example
+data:
+  controller.json: |
+    {
+      "token_file": "/credentials/control-token",
+      "plan": {
+        "revision": 1,
+        "enabled": true,
+        "lease_millis": 10000,
+        "nodes": [
+          {"node": "http://rfs-a-0.rustfs-internal:9003", "operation": null},
+          {"node": "http://rfs-a-1.rustfs-internal:9003", "operation": null},
+          {"node": "http://rfs-a-2.rustfs-internal:9003", "operation": null},
+          {"node": "http://rfs-a-3.rustfs-internal:9003", "operation": null}
+        ]
+      }
+    }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rustfs-internal
+  namespace: rustfs-example
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: rustfs
+  ports:
+    - name: native
+      port: 9000
+    - name: control
+      port: 9003
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rustfs-s3
+  namespace: rustfs-example
+spec:
+  selector:
+    app.kubernetes.io/name: rustfs
+  ports:
+    - name: s3
+      port: 9002
+      targetPort: 9002
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rfs-a
+  namespace: rustfs-example
+spec:
+  replicas: 4
+  serviceName: rustfs-internal
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: OnDelete
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rustfs
+      rustfs-pool: a
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rustfs
+        rustfs-pool: a
+    spec:
+      automountServiceAccountToken: false
+      nodeSelector:
+        kubernetes.io/os: linux
+        kubernetes.io/arch: amd64
+      terminationGracePeriodSeconds: 30
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  rustfs-pool: a
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      initContainers:
+        - name: directories
+          image: kuberic-rustfs:local
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/mkdir", "-p", "/storage/adapter", "/storage/data"]
+          volumeMounts:
+            - name: storage
+              mountPath: /storage
+      containers:
+        - name: adapter
+          image: kuberic-rustfs:local
+          imagePullPolicy: IfNotPresent
+          args: ["serve", "--config", "/config/node.json", "--local-node", "http://$(POD_NAME).rustfs-internal:9000"]
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          ports:
+            - name: native
+              containerPort: 9000
+            - name: s3
+              containerPort: 9002
+            - name: control
+              containerPort: 9003
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: control
+            periodSeconds: 3
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: control
+            initialDelaySeconds: 20
+            periodSeconds: 5
+            timeoutSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          volumeMounts:
+            - name: storage
+              mountPath: /storage
+            - name: config
+              mountPath: /config
+              readOnly: true
+            - name: credentials
+              mountPath: /credentials
+              readOnly: true
+            - name: temporary
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: rustfs-node-a
+        - name: credentials
+          secret:
+            secretName: rustfs-credentials
+            defaultMode: 0440
+        - name: temporary
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: storage
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 4Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rustfs-controller
+  namespace: rustfs-example
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rustfs-controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rustfs-controller
+    spec:
+      automountServiceAccountToken: false
+      nodeSelector:
+        kubernetes.io/os: linux
+        kubernetes.io/arch: amd64
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: controller
+          image: kuberic-rustfs:local
+          imagePullPolicy: IfNotPresent
+          args: ["controller", "--config", "/config/controller.json"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          volumeMounts:
+            - name: config
+              mountPath: /config
+              readOnly: true
+            - name: credentials
+              mountPath: /credentials
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: rustfs-controller
+        - name: credentials
+          secret:
+            secretName: rustfs-credentials
+            defaultMode: 0440
+            items:
+              - key: control-token
+                path: control-token
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rustfs-native-boundary
+  namespace: rustfs-example
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: rustfs
+  policyTypes: ["Ingress"]
+  ingress:
+    - ports:
+        - port: 9002
+          protocol: TCP
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: rustfs
+      ports:
+        - port: 9000
+          protocol: TCP
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: rustfs-controller
+      ports:
+        - port: 9003
+          protocol: TCP

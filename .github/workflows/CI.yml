@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      rustfs_e2e:
+        description: Build the pinned native image and run the isolated RustFS cluster suite
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -37,10 +42,32 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Check workspace
-        run: cargo check --workspace --all-targets --all-features
+        run: cargo check --locked --workspace --all-targets --all-features
 
       - name: Lint workspace
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
       - name: Test workspace
-        run: cargo test --workspace --all-features -- --test-threads=2
+        run: cargo test --locked --workspace --all-features -- --test-threads=2
+
+  rustfs-native-e2e:
+    if: github.event_name == 'workflow_dispatch' && inputs.rustfs_e2e
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install pinned kind
+        run: |
+          curl --fail --location --output "$RUNNER_TEMP/kind" https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64
+          checksum=$(curl --fail --location https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64.sha256 | awk '{print $1}')
+          printf '%s  %s\n' "$checksum" "$RUNNER_TEMP/kind" | sha256sum --check
+          chmod +x "$RUNNER_TEMP/kind"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Build and test pinned Linux native artifacts
+        run: docker build --file kuberic-rustfs/Dockerfile --tag kuberic-rustfs:e2e .
+
+      - name: Validate native quorum, recovery, fencing and topology
+        shell: pwsh
+        run: ./kuberic-rustfs/tests/e2e.ps1 -Image kuberic-rustfs:e2e

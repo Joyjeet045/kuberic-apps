@@ -18,6 +18,8 @@ clap = { version = "4", features = ["derive", "env"] }
 futures = "0.3"
 fs2 = "0.4"
 kuberic-runtime = { git = "https://github.com/youyuanwu/kuberic", rev = "131ccc9ddd7dbba9fb910d1000d4fbd2206c548a" }
+kuberic-native-runtime = { package = "kuberic-runtime", git = "https://github.com/Joyjeet045/kuberic", rev = "690c91c330915fb0fdef2d2e6c1afaa2125862e9", default-features = false, features = ["native"] }
+kuberic-controller = { git = "https://github.com/Joyjeet045/kuberic", rev = "690c91c330915fb0fdef2d2e6c1afaa2125862e9", features = ["native"] }
 crc32fast = "1"
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls"] }
 rocksdb = { version = "=0.25.0", default-features = false, features = ["bindgen-runtime"] }

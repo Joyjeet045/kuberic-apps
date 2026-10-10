@@ -87,6 +87,24 @@ impl RunningRustfs {
         self.pid
     }
 
+    pub fn observed_exit(&mut self) -> Result<Option<ExitReport>> {
+        if self.outcome.is_none() {
+            match self.completion.try_recv() {
+                Ok(outcome) => self.outcome = Some(outcome),
+                Err(oneshot::error::TryRecvError::Empty) => return Ok(None),
+                Err(error) => {
+                    self.outcome = Some(Err(format!("RustFS supervisor lost: {error}")));
+                }
+            }
+        }
+        self.outcome
+            .as_ref()
+            .expect("exit outcome recorded")
+            .clone()
+            .map(Some)
+            .map_err(anyhow::Error::msg)
+    }
+
     /// A service exit without an explicit shutdown request is always an error.
     pub async fn wait(&mut self) -> Result<ExitReport> {
         if self.outcome.is_none() {
@@ -134,6 +152,7 @@ fn run(
     let binary = config.binary.verify()?;
     let lease = TopologyLease::acquire(&config.state_directory, &config.topology)?;
     let mut command = command(&config, &binary);
+    lease.inherit_lock(&mut command)?;
     if requests.try_recv() != Err(mpsc::TryRecvError::Empty) {
         bail!("RustFS startup cancelled before launch");
     }
@@ -384,6 +403,81 @@ mod tests {
 
     fn config_for(root: &Path) -> LaunchConfig {
         config(root)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn inherited_lock_blocks_recovery_until_the_orphaned_child_exits() {
+        let root = tempfile::tempdir().unwrap();
+        let config = config(root.path());
+        let lease = TopologyLease::acquire(&config.state_directory, &config.topology).unwrap();
+        let mut command = fixture_command(&config, &std::env::current_exe().unwrap(), "run");
+        lease.inherit_lock(&mut command).unwrap();
+        lease.begin_process().unwrap();
+        let mut child = OwnedChild(command.spawn().unwrap());
+        drop(command);
+        drop(lease);
+        ready(root.path()).await;
+        assert!(TopologyLease::acquire(&config.state_directory, &config.topology).is_err());
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        let recovered = TopologyLease::acquire(&config.state_directory, &config.topology).unwrap();
+        assert!(!config.state_directory.join("process-active").exists());
+        drop(recovered);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires the pinned real RustFS executable"]
+    async fn native_executable_retains_ownership_after_supervisor_lock_is_dropped() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = config(root.path());
+        config.binary = BinaryPin::new(
+            std::env::var_os("KUBERIC_RUSTFS_TEST_BINARY")
+                .expect("missing native binary")
+                .into(),
+            &std::env::var("KUBERIC_RUSTFS_TEST_SHA256").expect("missing native checksum"),
+        )
+        .unwrap();
+        config.address = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        config.validate().unwrap();
+        let binary = config.binary.verify().unwrap();
+        let lease = TopologyLease::acquire(&config.state_directory, &config.topology).unwrap();
+        let mut command = config.command(&binary);
+        lease.inherit_lock(&mut command).unwrap();
+        lease.begin_process().unwrap();
+        let mut child = OwnedChild(command.spawn().unwrap());
+        drop(command);
+        drop(lease);
+        let health = crate::HealthClient::new(
+            &format!("http://{}", config.address),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(90), async {
+            loop {
+                assert!(child.0.try_wait().unwrap().is_none(), "native child exited");
+                match health.probe(crate::HealthProbe::Readiness).await {
+                    Ok(crate::HealthStatus::Healthy) => break,
+                    result => eprintln!("native ownership test startup: {result:?}"),
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let error = TopologyLease::acquire(&config.state_directory, &config.topology)
+            .err()
+            .expect("ready native child released its inherited ownership lock");
+        assert!(error.to_string().contains("already owned"), "{error:#}");
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        let recovered = TopologyLease::acquire(&config.state_directory, &config.topology).unwrap();
+        assert!(!config.state_directory.join("process-active").exists());
+        drop(recovered);
     }
 
     #[cfg(unix)]
