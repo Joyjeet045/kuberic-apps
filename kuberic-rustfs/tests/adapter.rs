@@ -14,10 +14,6 @@ use kuberic_rustfs::{CredentialFiles, Topology};
 use reqwest::{Client, Method};
 use sha2::{Digest, Sha256};
 
-fn address() -> Result<SocketAddr> {
-    Ok(TcpListener::bind("127.0.0.1:0")?.local_addr()?)
-}
-
 async fn s3(
     client: &Client,
     endpoint: SocketAddr,
@@ -104,6 +100,9 @@ async fn native_adapter_fences_restarts_replays_and_retains_acknowledged_objects
     };
     fs::write(&credentials.access_key, "adapter-test")?;
     fs::write(&credentials.secret_key, "adapter-test-secret-value")?;
+    let native_listener = TcpListener::bind("127.0.0.1:0")?;
+    let client_listener = TcpListener::bind("127.0.0.1:0")?;
+    let control_listener = TcpListener::bind("127.0.0.1:0")?;
     let config = AdapterConfig {
         binary: std::env::var_os("KUBERIC_RUSTFS_TEST_BINARY")
             .context("missing binary")?
@@ -116,9 +115,9 @@ async fn native_adapter_fences_restarts_replays_and_retains_acknowledged_objects
             local_node: None,
             erasure_set_drive_count: None,
         },
-        native_address: address()?,
-        client_address: address()?,
-        control_address: address()?,
+        native_address: native_listener.local_addr()?,
+        client_address: client_listener.local_addr()?,
+        control_address: control_listener.local_addr()?,
         control_token_file: root.path().join("token"),
         shutdown_grace_seconds: 3,
     };
@@ -126,6 +125,7 @@ async fn native_adapter_fences_restarts_replays_and_retains_acknowledged_objects
         .no_proxy()
         .timeout(Duration::from_secs(10))
         .build()?;
+    drop(native_listener);
     let adapter = RustfsAdapter::start(&config).await?;
     let checked = async {
         ready(&adapter).await?;
