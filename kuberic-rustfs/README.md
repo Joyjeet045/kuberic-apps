@@ -1,477 +1,243 @@
 # kuberic-rustfs
 
-Work toward [issue #5](https://github.com/youyuanwu/kuberic-apps/issues/5):
-let RustFS own object storage, replication, erasure coding, quorum, and healing.
-Kuberic will integrate lifecycle, health, and topology through a native adapter,
-following the separation of responsibilities in the
-[PostgreSQL example](https://github.com/youyuanwu/kuberic/tree/131ccc9ddd7dbba9fb910d1000d4fbd2206c548a/examples/postgres).
-RustFS is not a PostgreSQL-style primary/standby engine.
+RustFS example for [issue #5](https://github.com/youyuanwu/kuberic-apps/issues/5).
+RustFS owns object storage, replication, erasure coding, quorum, and healing.
+Kuberic integrates lifecycle, health, leased client access, and append-only pool
+expansion through `kuberic_native_runtime::native::NativeApplication`.
 
-## Consolidated change
+This follows the [PostgreSQL example's](https://github.com/youyuanwu/kuberic/tree/131ccc9ddd7dbba9fb910d1000d4fbd2206c548a/examples/postgres)
+native-replication ownership boundary, not RocksDB's log replication. There is
+no second data quorum, shard-copy implementation, synthetic LSN, or RustFS
+primary/standby role. Like the other applications, this is a workspace crate
+with a pinned dependency, Docker image, Kubernetes manifests, and Rust tests.
 
-This example is delivered in **one application PR**, covering the native
-foundations, adapter, recovery, topology operations, deployment, and distributed
-tests. A separate [framework prerequisite PR](https://github.com/youyuanwu/kuberic/pull/141) introduces its
-opt-in `native` runtime and controller boundary. No application PR stack is
-required. The native boundary deliberately does not implement the log-based
-`Replicator` contract or use `KubericSet`.
+**Status: experimental example, not production-certified.** The native framework
+boundary depends on [prerequisite PR #141](https://github.com/youyuanwu/kuberic/pull/141).
+Page/RocksDB retain their existing framework revision. Production adoption also
+requires deployment-specific storage, backup/restore, upgrade, failure-domain,
+capacity, and certificate-rotation qualification.
 
-### Adapter constraints
+## Supported behavior
 
-- Health is observation, not authority, durable acknowledgement, a replication
-  position, or evidence that healing/topology changes have completed.
-- S3, admin, and internode RPC share RustFS's S3 listener. Access fencing must
-  not accidentally block internode traffic or reinterpret Kuberic's primary
-  role as RustFS data leadership.
-- Existing pool endpoint order and erasure-set layout are persistent identity.
-  Do not implement scaling by changing the endpoint count of an existing pool,
-  reordering drives, copying shards, or deleting RustFS format metadata.
-- Keep credentials and RustFS data under their respective owners. This work
-  must not introduce a second data-replication or quorum implementation.
+- Start, supervise, stop/reap, and reopen the checksum-pinned RustFS foreground
+  process on the same storage.
+- Observe RustFS's own liveness, readiness, read-health, and write-health.
+- Fence client connections using incarnation/revision-bound expiring authority.
+- Durably journal idempotent `restart` and append-only `expand` operations.
+- Require the exact native pool map and native readiness before completion.
 
-## Native health probes
+**Not supported:** decommission, pool retirement/removal, shrinking or replacing
+existing pools, changing erasure width, data migration, automatic upgrades, or
+deleting storage. These requests fail explicitly. RustFS 1.0.1 decommission did
+not complete in local distributed validation because of unresolved native
+`.rustfs.sys/buckets/.heal/` metadata; that workflow is deliberately not exposed.
+Do not deploy this revision over a journal with an unfinished operation from an
+earlier experimental decommission implementation.
 
-The health client remains usable independently of the adapter and coordinator.
+## Build and test
 
-Create a `HealthClient` with a direct node S3-listener origin and a positive
-per-request timeout. HTTP and HTTPS are supported with certificate verification;
-URL credentials, non-root paths, queries, fragments, and port zero are rejected.
-The unauthenticated RustFS health endpoints must be enabled. Do not use a console
-URL or a load balancer when observing a particular node.
-
-| `HealthProbe` | GET path | Native signal |
-| --- | --- | --- |
-| `Liveness` | `/health/live` | Local process liveness, not storage readiness |
-| `Readiness` | `/health/ready` | RustFS's node-readiness decision |
-| `ClusterRead` | `/minio/health/cluster/read` | RustFS's cluster read-health decision |
-| `ClusterWrite` | `/minio/health/cluster` | RustFS's cluster write-health decision |
-
-`probe` returns `Healthy` for HTTP 200 and `Unhealthy` for HTTP 503. Other status
-codes, including redirects, authentication errors, and disabled/missing
-endpoints, return errors with probe context. Transport failures and timeouts are
-errors too, never a cached success or a native verdict. Callers must surface
-these errors rather than treating failed observations as health.
-
-Each call makes a fresh request. Redirect following and environment proxies are
-disabled so a probe does not silently observe another destination. Automatic
-retries are disabled; the future supervisor owns polling and backoff. The client
-uses status codes and does not consume response bodies: RustFS supports both
-minimal and detailed payloads. It does not calculate quorum or combine the four
-independent signals into a single "ready" flag.
-
-## Native lifecycle and startup topology
-
-`LaunchConfig` combines a `BinaryPin`, credential-file paths, a dedicated adapter
-state directory, a `Topology`, the S3 listen address, and a shutdown grace period.
-`RunningRustfs::start` returns after OS process creation, **not** application
-readiness. Monitor `wait()` for an unexpected exit, and call `shutdown()` to stop
-and reap the owned foreground child. Even a spontaneous exit code zero is an
-unexpected service exit. Observe readiness separately.
-
-### Executable and credentials
-
-[rustfs-release.json](rustfs-release.json) pins RustFS **1.0.1**, versioned release
-URLs, and archive checksums. Verify the archive before extraction.
-`BinaryPin::new(absolute_executable_path, sha256)` takes the **executable's**
-checksum, not the archive checksum; it is rechecked before every spawn. The
-verified Windows and Linux executable checksums are recorded too.
-Keep the executable and its parent directories administrator-controlled and
-immutable between verification and launch. This library does not download,
-upgrade, execute shell wrappers, or validate arbitrary RustFS versions.
-
-Credentials must be supplied through existing access-key and secret-key files
-with operator-managed permissions. Only file paths are passed to RustFS; key
-contents are not passed on the command line or stored in topology metadata.
-The process launcher passes only paths; the admin client reads these files to
-sign each native administrative request with AWS Signature V4. It never logs
-the credentials. Child stdout/stderr are inherited for native diagnostics.
-The child's environment is cleared apart from platform essentials and explicit
-launch settings, so inherited RustFS/MinIO options cannot silently change the
-layout or select default credentials. The console and update check are disabled.
-
-### Topology and storage contract
-
-- Supply ordered pool arguments exactly as RustFS should receive them.
-  Supported numeric ellipses are increasing, non-padded `{start...end}` ranges,
-  bounded to 1024 total endpoints. Expansion is used to validate and identify
-  local paths; original arguments are passed unchanged, without a shell.
-- Use `local_node: None` for absolute local-directory arguments. For distributed
-  pools, provide the direct HTTP node origin matching its endpoint URLs and
-  listen port. The process foundation currently supports **HTTP only**; TLS
-  credential/configuration plumbing is not implemented. The separate health
-  client can still probe HTTPS.
-- Optional erasure-set width is persisted, must be 2-16, and must divide each
-  pool's endpoint count. RustFS remains responsible for final native layout,
-  parity, quorum, and storage validation.
-- The state directory and all local volume directories must already exist.
-  Their resolved paths must be disjoint. These directories must be dedicated
-  to this instance and must not be reassigned or modified by another operator
-  while it is running. The state-directory lock coordinates this library's
-  instances; it is not a distributed lease or a fence against unmanaged RustFS
-  processes or another state directory pointing at the same disks.
-- A fresh state directory may adopt only empty volumes. The adapter atomically
-  records versioned `topology.json` before launch, including exact pool order,
-  local identity, erasure width, and resolved local paths. Established starts
-  require an exact match; corrupt, unknown, missing, or mismatched metadata fails
-  closed. No existing volume contents are reformatted, copied, or deleted.
-- Unix metadata writes sync the containing directory after persistence/removal.
-  File contents are synced on every platform; Windows directory-entry durability
-  and power-loss behavior have not been certified.
-
-### Shutdown and interrupted ownership
-
-A dedicated supervisor retains the child handle and exclusive state-directory
-lock even if an async startup/shutdown future is cancelled. Unix shutdown sends
-SIGTERM to the unreaped owned child, then forces termination after the configured
-grace period. Windows uses termination immediately; `ExitReport::forced` reports
-this explicitly. Reaping after forced termination is bounded to five seconds.
-`shutdown()` is bounded to the grace period plus six seconds. Dropping the handle
-requests shutdown but does not synchronously wait; use `shutdown()` when cleanup
-must be confirmed. This supervises one foreground executable, not a process tree.
-
-Before spawning, a synced `process-active` marker records unresolved process
-ownership. On Linux, the child inherits an exclusive `flock` descriptor across
-exec. The pinned foreground executable must retain that descriptor. Reopening
-can clear the versioned inherited-lock marker only after obtaining the same
-exclusive lock, proving that neither the old supervisor nor its child retains
-ownership. An orphan that is still alive blocks reopening. No PID guessing or
-stale-PID killing is used. Container teardown must stop the foreground process;
-the next container can then reopen the same persistent storage.
-
-Windows and legacy/unrecognized markers remain fail-closed. To recover these,
-first stop/fence the previous host and prove
-that its RustFS process can no longer access the volumes. Only then remove that
-specific marker manually and restart with the original topology and state root.
-Do not remove `topology.json`, the lock file, or RustFS metadata to force startup.
-Do not bypass the inherited-lock check or reuse a state root on different disks.
-
-## Native adapter and controller
-
-`RustfsAdapter` implements `kuberic_native_runtime::native::NativeApplication`.
-`server::serve` runs the owned child, a byte-preserving TCP S3 gateway, and an
-authenticated control listener. Client access starts closed. Control authority
-is scoped to a random adapter incarnation and monotonic revision, with a lease
-bounded to 30 seconds. Changes, expiration, shutdown, and process failure revoke
-existing gateway connections. This cannot roll back a request already accepted
-by RustFS. The native listener is never gated: peer replication must remain
-available while client access is closed. Network policy must prevent clients
-from bypassing the gateway and reaching that listener directly.
-
-The control listener exposes:
-
-| Method | Path | Contract |
-| --- | --- | --- |
-| GET | `/v1/native/observation` | Incarnation, authority revision, current access, and either all four native health verdicts or an explicit unavailable observation |
-| POST | `/v1/native/authority` | Exact-incarnation, revision-fenced client authority |
-| POST | `/v1/native/operation` | Closed authority plus an idempotent native operation |
-| POST | `/v1/native/operation/status` | Read-only lookup using exact operation ID and input |
-| GET | `/ready` | Gateway authority and native node readiness; no durability or catch-up claim |
-| GET | `/live` | Owned foreground process has not exited; independent of native quorum |
-
-All control routes except `/ready` and `/live` require a bearer token from a separate
-32-256-character token file. S3 credentials remain native RustFS credentials.
-These HTTP listeners require a trusted private network or an external TLS
-boundary; the example does not configure native TLS.
-
-`controller::run` reloads a JSON `ControllerConfig` and invokes the framework's
-native reconciler. Plans have positive, increasing revisions and fixed node
-origins. Revision N maps to closed authority 2N and final authority 2N+1.
-All nodes are fenced before a topology transition. The controller requires
-durable completion evidence from every participating node before reopening.
-Once a plan is established, reachable nodes continue receiving leases even
-if a peer is unavailable: RustFS, not an all-nodes controller check, decides
-read and write quorum. Errors remain explicit; unavailable nodes are not
-reported healthy or credited with completion.
-Each control request is bounded to one quarter of the configured lease, leaving
-time for observation, receipt lookup, authorization, and the polling interval.
-A connected but unresponsive peer must not exhaust healthy peers' renewal budget.
-
-The adapter journal uses SQLite WAL with FULL synchronization and an exclusive
-adapter-state lock. Operation IDs cannot be reused with different inputs;
-only one operation may be pending per node. Accepted work survives controller
-retries, connection cancellation, and adapter restarts. Completion receipts
-are persisted before being returned and survive later topology changes.
-
-Supported operations are:
-
-- `restart`: stop/reap the foreground child and reopen the same storage.
-  Completion requires the native pool map and node readiness, not healing.
-- `expand`: append complete ordered pools, preserving all established pools,
-  local identity, and erasure width. New local directories must already exist
-  and be empty. Intent is durable before shutdown and restart; recovery is
-  forward-only. Completion requires the exact native pool map, active added
-  pools, and native readiness on each node.
-- `decommission`: invoke RustFS's native pool decommission API and observe its
-  terminal `complete`/`decommissioned` result, with zero failed objects/bytes
-  and no reported unresolved entries. Empty unresolved-entry lists can be
-  omitted by the pinned native response. The adapter retains pool endpoints,
-  volumes, and metadata; it does not implement generic replica removal or
-  delete decommissioned storage.
-- `finalizeDecommission`: on surviving nodes, remove exactly one completed pool
-  from the native startup arguments. Requires that node's durable `decommission`
-  receipt for the exact previous topology. Remaining pool order, local identity,
-  and erasure width cannot change. Intent is durable before restart, and
-  completion requires the exact surviving pool map, active pools, and readiness.
-  Retired data directories and PVCs are not deleted.
-
-Failed/canceled native decommission remains an explicit pending operation with
-diagnostics; the adapter does not silently restart it or declare success.
-Operator intervention must follow the native recovery procedure. Reordering,
-resizing, replacing pools, changing erasure width, and unsupported operations
-are rejected. No operation manufactures a log position or copies RustFS shards.
-
-## Validation
-
-Use the workspace's pinned toolchain. This crate requires Rust 1.95 or newer.
+Use the pinned workspace toolchain and `protoc`. This crate requires Rust 1.95+.
 
 ```sh
 cargo fmt --all -- --check
-cargo check --locked -p kuberic-rustfs --all-targets --all-features
 cargo clippy --locked -p kuberic-rustfs --all-targets --all-features -- -D warnings
 cargo test --locked -p kuberic-rustfs --all-features
+docker build --file kuberic-rustfs/Dockerfile --tag kuberic-rustfs:local .
 ```
 
-Default tests use ephemeral loopback HTTP servers and owned subprocess fixtures.
-They require no external network, RustFS installation, native RocksDB build, or
-Kubernetes cluster. They exercise topology persistence/corruption/mismatch,
-exclusive ownership, unsafe inputs, checksum/spawn failures, observed exits,
-cancelled startup, drop cleanup, restart, and stopping only the owned child.
-Unix tests additionally verify forced shutdown when SIGTERM is ignored.
-The existing workspace CI automatically includes these tests.
+The default Rust tests require no cluster or RustFS installation. They cover
+health contracts, TLS validation, authority transport, topology identity,
+durable intent/replay, invalid input, process ownership, and cancellation.
+The Docker build also runs Linux ownership tests and a real TLS S3
+put/get/restart/reopen test as the non-root runtime user. CI runs that same image
+build on pull requests. PowerShell and kind are not repository dependencies.
 
-The opt-in native smoke test starts a pinned RustFS executable in isolated
-temporary storage, waits for readiness, stops it, and reopens the engine-created
-storage using the same topology. In PowerShell:
+For a separately installed executable matching [rustfs-release.json](rustfs-release.json),
+set `KUBERIC_RUSTFS_TEST_BINARY` and `KUBERIC_RUSTFS_TEST_SHA256` to its absolute
+path and executable checksum, then run:
 
-```powershell
-$env:KUBERIC_RUSTFS_TEST_BINARY = 'C:\tools\rustfs.exe'
-$env:KUBERIC_RUSTFS_TEST_SHA256 = 'ee29f347d31af358286e096ea481477044e0a6cd590706526c13879a400143d7'
-cargo test --locked -p kuberic-rustfs --test native -- --ignored --nocapture
-cargo test --locked -p kuberic-rustfs --test adapter -- --ignored --nocapture
+```sh
+cargo test --locked -p kuberic-rustfs --test native --test adapter -- --ignored
 ```
 
-This smoke test was run successfully on Windows with the checksum-verified 1.0.1
-release. The real adapter test also verifies S3 put/get across a native restart
-and an adapter reopen, persistent operation receipts, conflicting-ID rejection,
-and rejection of the previous adapter's authority. This does not claim
-distributed replication, pool expansion/decommission, power-loss, or Kubernetes
-validation; those require the distributed harness below.
+The manifest pins RustFS **1.0.1**, including release archive and executable
+checksums. The executable is rehashed before every spawn. Its file and parent
+directories must be administrator-controlled and immutable. The runtime image
+uses Ubuntu 24.04 for native glibc compatibility and includes a CA trust store.
 
-The probe contract was checked against RustFS source at
-[`446479791ec6ea0f2343036cfbd4fa04fc0c43c5`](https://github.com/rustfs/rustfs/blob/446479791ec6ea0f2343036cfbd4fa04fc0c43c5/rustfs/src/server/health.rs).
-See also the official
-[health endpoint reference](https://docs.rustfs.com/en/operations/status-check)
-and [cluster lifecycle constraints](https://docs.rustfs.com/en/operations/cluster-lifecycle).
-The launch flags were additionally verified using the pinned 1.0.1 executable.
+Local validation also exercised an isolated four-node HTTPS pool, native quorum
+loss, same-PVC recovery, NetworkPolicy isolation, lease expiry, and expansion
+to eight nodes, checking hashes of 128 acknowledged one-MiB objects. This does
+not certify physical disk power-loss durability, arbitrary partitions, or
+completed healing. The unverified decommission workflow and its orchestration
+script are not shipped.
 
-## Kubernetes runbook
+## Storage and process ownership
 
-The example uses StatefulSets for Kubernetes resource lifecycle and the native
-Kuberic coordinator for leased access and topology operations. It does not
-translate RustFS into a primary/standby or scalar-LSN application.
+`LaunchConfig` specifies a `BinaryPin`, credential files, state directory,
+ordered `Topology`, listen address, native TLS, and shutdown grace period.
+Startup means process creation, not readiness. Even an unrequested exit code
+zero is a service failure.
 
-### Build and deploy
+- State and volume directories must exist, be dedicated to the instance, and
+  resolve to disjoint paths. Fresh state can adopt only empty volumes.
+- `topology.json` persists exact pool order, local origin, erasure width, and
+  resolved local paths before launch. Unknown/corrupt/mismatched records fail
+  closed; existing storage is never reformatted or copied.
+- Increasing non-padded numeric ellipses such as `{0...3}` are supported, bounded
+  to 1024 endpoints. Erasure width must be 2-16 and divide each pool's endpoint
+  count. RustFS performs final native layout and quorum validation.
+- Bootstrap configuration stays unchanged after initialization. The SQLite WAL
+  journal, with FULL synchronization, owns subsequent desired topology and
+  operation receipts. One operation may be pending per node; an ID cannot be
+  reused with different input.
+- Linux inherits an exclusive ownership lock into the native child. Reopening
+  cannot proceed while an orphan retains that lock. A synced `process-active`
+  marker records unresolved ownership; no PID guessing is used.
+- Unix shutdown sends SIGTERM, then forces termination after the grace period.
+  Reaping after forced termination is bounded to five seconds. Windows uses
+  immediate termination. `shutdown()` waits; dropping the handle only requests
+  shutdown while the supervisor retains ownership.
+- Windows and legacy/unrecognized active markers fail closed. First fence the
+  previous host and prove it cannot access storage; only then remove that
+  specific marker. Never remove topology, locks, or native metadata to force
+  startup. Windows directory-entry power-loss durability is not certified.
 
-Run these PowerShell commands from the workspace root:
+Locks coordinate this adapter's instances, not unmanaged processes or another
+state directory using the same disks. Storage ownership remains an operator
+responsibility.
 
-```powershell
-docker build --file .\kuberic-rustfs\Dockerfile --tag kuberic-rustfs:local .
+## TLS, credentials, and access fencing
+
+Distributed and non-loopback native listeners require
+`native_tls: {"directory": "/tls"}`. The directory contains
+`rustfs_cert.pem`, `rustfs_key.pem`, and a nonempty `ca.crt` bundle, following the
+[pinned native TLS layout](https://github.com/rustfs/rustfs/blob/1.0.1/crates/tls-runtime/src/source.rs).
+Plaintext launch is limited to loopback-only local storage and client listeners.
+Distributed pool URLs must consistently use HTTPS; the scheme is persistent
+topology identity, not an in-place migration switch.
+
+RustFS terminates native and S3 TLS. The gateway forwards encrypted bytes
+unchanged. Adapter health/admin clients verify the configured CA and loopback
+IP certificate identity. Control TLS requires `control_tls.certificate_file`
+and `control_tls.private_key_file`; the controller requires HTTPS origins and
+`ca_certificate_file`. Certificate and hostname verification are never disabled.
+No redirects or environment proxies are used.
+
+Control requests also require a bearer token from `control_token_file`,
+containing 32-256 printable non-whitespace ASCII characters. Native credentials
+come from `credentials.access_key` and `credentials.secret_key` files; the native
+admin client signs requests with AWS Signature V4. Secrets are not command-line
+arguments or topology data. The child's environment is cleared except for
+platform essentials and explicit launch settings. Console/update checks are off.
+
+Client authority starts closed and is scoped to a random adapter incarnation,
+monotonic revision, and a lease of at most 30 seconds. Revocation, expiry,
+shutdown, and native process failure close existing gateway connections. This
+cannot roll back a request already accepted by RustFS. Native peer traffic is
+never gated: **NetworkPolicy must prevent clients from bypassing the gateway**.
+Health does not grant authority or prove durable acknowledgement/healing.
+
+## Control API
+
+All routes use HTTPS. Only `/ready` and `/live` are unauthenticated.
+
+| Method | Path | Meaning |
+| --- | --- | --- |
+| GET | `/v1/native/observation` | Incarnation, revision, access, and native health or explicit unavailability |
+| POST | `/v1/native/authority` | Exact-incarnation, revision-fenced authority |
+| POST | `/v1/native/operation` | Closed authority and idempotent operation |
+| POST | `/v1/native/operation/status` | Receipt lookup using exact operation ID/input |
+| GET | `/ready` | Client authority and native readiness |
+| GET | `/live` | Owned foreground process has not exited |
+
+The independent `HealthClient` probes `/health/live`, `/health/ready`,
+`/minio/health/cluster/read`, and `/minio/health/cluster`. Only HTTP 200 and 503
+are native healthy/unhealthy verdicts. All other statuses, transport errors,
+and timeouts are explicit observation failures, never cached success.
+
+## Deploy
+
+Use four schedulable Linux AMD64 nodes, a dynamic default StorageClass, and a
+NetworkPolicy-enforcing CNI. Each native process owns one PVC; pool anti-affinity
+separates its drives across nodes. Publish the image and replace the local image
+references in [base.yaml](deploy/base.yaml) and [expand.yaml](deploy/expand.yaml)
+with an immutable registry digest before deploying outside a local cluster.
+
+Create namespace `rustfs-example` and these Secrets from protected files:
+
+```sh
 kubectl create namespace rustfs-example
-kubectl -n rustfs-example create secret generic rustfs-credentials `
-  --from-file=access-key=C:\secure\rustfs\access-key `
-  --from-file=secret-key=C:\secure\rustfs\secret-key `
-  --from-file=control-token=C:\secure\rustfs\control-token
-kubectl apply -f .\kuberic-rustfs\deploy\base.yaml
+kubectl -n rustfs-example create secret generic rustfs-credentials \
+  --from-file=access-key=/secure/access-key \
+  --from-file=secret-key=/secure/secret-key \
+  --from-file=control-token=/secure/control-token
+kubectl -n rustfs-example create secret generic rustfs-tls \
+  --from-file=ca.crt=/secure/ca.crt \
+  --from-file=tls.crt=/secure/tls.crt \
+  --from-file=tls.key=/secure/tls.key
+kubectl apply -f kuberic-rustfs/deploy/base.yaml
 kubectl -n rustfs-example rollout status statefulset/rfs-a --timeout=300s
-kubectl -n rustfs-example logs deployment/rustfs-controller
 kubectl -n rustfs-example port-forward service/rustfs-s3 9002:9002
 ```
 
-Use an existing Kubernetes context only when you intend to deploy into it.
-The cluster needs four schedulable Linux AMD64 nodes, a default dynamic StorageClass, and
-a NetworkPolicy-enforcing CNI. Same-pool anti-affinity places each drive on a
-different node. There is one drive/PVC per native process; the example does not
-bypass native disk validation. For kind, load the image into every cluster node
-before applying the manifests. For another cluster, publish the image and replace
-both manifests' image references with your registry's immutable digest.
+`tls.crt` contains the serving certificate and intermediate chain; `tls.key`
+is its unencrypted PEM key. Include DNS SANs for `rfs-a-0.rustfs-internal`
+through `rfs-a-3.rustfs-internal`, the four B names before expansion, and S3
+service names clients use. Include IP SAN `127.0.0.1` for local probes and
+port-forwarding (`::1` if configured). Use an S3 client at
+`https://127.0.0.1:9002` with the CA bundle; never disable verification.
 
-Supply your own credential files; the control token must contain 32-256 printable
-non-whitespace ASCII characters. Do not commit these files. The controller
-receives only the control token, not the S3 root credentials. Use a configured
-S3 client against `http://127.0.0.1:9002` to create a bucket and put/get objects.
-Do not expose port 9000 or 9003 to clients. The policy permits native traffic
-only between RustFS Pods and control traffic only from the controller Pods.
-Membership labels, controller plans, Secrets, and storage require trusted
-administrators. TLS and production credential rotation remain operator work.
+The controller mounts only the control token and CA, not S3 credentials or the
+serving key. Kubernetes HTTPS probes do not validate server certificates, but
+the controller does. Membership labels, plans, Secrets, and storage require
+trusted administrators. Use least-privilege native S3 identities for clients.
 
-The image build verifies both native checksums, runs Linux unit tests, and runs
-the real native ownership and adapter S3 tests as the unprivileged runtime user.
-The native release needs Ubuntu 24.04's glibc; Debian Bookworm is a build stage,
-not a compatible native runtime. The runtime also includes the system CA trust
-store required when RustFS constructs its internode HTTP client.
+Certificates/tokens are loaded at adapter startup. Renew before expiry and
+restart deliberately with the same PVCs and identity. Distribute overlapping
+CA trust to the controller before rotating certificates. Coordinate token
+rotation as maintenance; mixed tokens fail closed. Resource/PVC limits in the
+manifests are examples, not production sizing.
 
-### Publish an operation
+## Restart and expand
 
-Keep the initial node ConfigMaps unchanged after bootstrap. The durable adapter
-journal owns each node's desired topology thereafter. Keep one trusted,
-persistent controller plan, never decrease its revision, and never change the
-input associated with an accepted revision or operation ID.
+The controller reloads the `controller.json` ConfigMap. Use one trusted,
+persistent plan, positive increasing revisions, and stable direct HTTPS node
+origins. Revision N maps to closed authority 2N and final authority 2N+1. Do not
+reuse a revision or operation ID with changed input or restore a stale plan.
+ConfigMap projection is asynchronous; wait for observed application, not just
+successful `kubectl apply`.
 
-Export the current plan before editing it:
-
-```powershell
-$config = kubectl -n rustfs-example get configmap rustfs-controller `
-  -o 'jsonpath={.data.controller\.json}' | ConvertFrom-Json -AsHashtable
-$config.plan.revision++
-```
-
-Each node entry has a direct control origin and either `operation: null` or an
-operation with a stable ID and one of these request shapes:
+A node's operation is `null` or has one of these shapes:
 
 ```json
-{"id":"restart-2","request":{"kind":"restart","topology":{"pools":["http://rfs-a-{0...3}.rustfs-internal:9000/storage/data"],"local_node":"http://rfs-a-0.rustfs-internal:9000","erasure_set_drive_count":4}}}
+{"id":"restart-2","request":{"kind":"restart","topology":{"pools":["https://rfs-a-{0...3}.rustfs-internal:9000/storage/data"],"local_node":"https://rfs-a-0.rustfs-internal:9000","erasure_set_drive_count":4}}}
 ```
-
-Use the node-specific `local_node`; never copy another node's identity.
-Replace previous operation entries when preparing a new plan. Once the complete
-node list and operations have been prepared, publish the configuration:
-
-```powershell
-$config | ConvertTo-Json -Depth 30 | Set-Content -Encoding utf8NoBOM .\controller.json
-kubectl -n rustfs-example create configmap rustfs-controller `
-  --from-file=controller.json=.\controller.json --dry-run=client -o yaml |
-  kubectl -n rustfs-example apply -f -
-kubectl -n rustfs-example logs deployment/rustfs-controller --follow
-```
-
-ConfigMap projection is asynchronous. Wait for the new plan to report applied,
-not merely for the ConfigMap update to succeed. A plan transition closes client
-access on all participants until durable native completion is observed.
-Controller loss also closes client access after the lease expires; it does not
-stop native peer traffic. Restore the same persistent plan to resume renewal.
-
-### Append a pool and decommission
-
-Apply [deploy/expand.yaml](deploy/expand.yaml) to create the four `rfs-b` nodes,
-whose bootstrap topology contains both pools. Then publish a higher revision
-containing all eight node origins:
-
-- A nodes: `expand` requests with `previous` equal to the exact one-pool topology
-  and `target` equal to the two-pool topology. Each retains its own local origin.
-- B nodes: `operation: null`; their initial topology already contains both pools.
-- The ordered target pools are the original A expression followed by
-  `http://rfs-b-{0...3}.rustfs-internal:9000/storage/data`.
-
-Wait for the plan to apply and for native readiness on all eight nodes.
-The pinned native implementation can latch pool-metadata recovery during
-expansion; its own distributed tests use a coordinated graceful restart after
-the expanded map has converged. Healthy S3 reads alone do not prove that native
-topology mutations are unblocked. For this maintenance restart:
-
-1. Publish a higher revision with all eight nodes, no operations, and
-   `enabled: false`; wait for that plan to apply everywhere.
-2. Scale both StatefulSets to zero and wait for all eight Pods to be deleted
-   before restoring both to four replicas. Retain every PVC and bootstrap
-   ConfigMap. This guarantees an all-stopped barrier, unlike independent
-   per-node `restart` operations.
-3. Wait for native `health.ready` in the authenticated observation on every
-   node, while confirming `accepting_clients` remains false. Do not wait for
-   Kubernetes Pod readiness here: the adapter's `/ready` deliberately also
-   requires client authority. Then publish another higher revision with all
-   eight nodes, no operations, and `enabled: true`.
-4. Verify native read/write health and all acknowledged objects through a B node.
-
-To drain pool A, publish another higher revision with a `decommission` request
-on every participant, for example revision 6:
 
 ```json
-{"id":"decommission-6","request":{"kind":"decommission","topology":{"pools":["http://rfs-a-{0...3}.rustfs-internal:9000/storage/data","http://rfs-b-{0...3}.rustfs-internal:9000/storage/data"],"local_node":"http://rfs-a-0.rustfs-internal:9000","erasure_set_drive_count":4},"pool":0}}
+{"id":"expand-3","request":{"kind":"expand","previous":{"pools":["https://rfs-a-{0...3}.rustfs-internal:9000/storage/data"],"local_node":"https://rfs-a-0.rustfs-internal:9000","erasure_set_drive_count":4},"target":{"pools":["https://rfs-a-{0...3}.rustfs-internal:9000/storage/data","https://rfs-b-{0...3}.rustfs-internal:9000/storage/data"],"local_node":"https://rfs-a-0.rustfs-internal:9000","erasure_set_drive_count":4}}}
 ```
 
-Adjust the local origin for each participant. RustFS moves the objects; Kuberic
-does not copy shards. Completion requires native terminal success, not an empty
-pool, elapsed time, or green readiness. Keep the full topology and all PVCs
-until every participant has a durable completion receipt. This example does not
-authorize arbitrary StatefulSet scale-down, endpoint removal, or deletion of
-decommissioned storage.
-If a process/Pod restarts, keep its same PVC and bootstrap identity; its journal
-resumes accepted work and preserves receipts. Failed/canceled decommission
-requires investigation through the native admin interface; do not erase the
-journal or format metadata to force an apparent success.
+For expansion, apply [expand.yaml](deploy/expand.yaml), then publish a higher
+revision containing all eight nodes: A nodes receive node-specific `expand`
+operations and B nodes have `operation: null` because their bootstrap already
+includes both pools. Preserve exact existing pool order, local origins, and
+erasure width; new local volumes must exist and be empty.
 
-An interrupted native worker can leave a terminal failed attempt, not a resumable
-running attempt. Inspect `GET /rustfs/admin/v3/decommission/status` using signed
-native administration. The adapter must remain pending and client access closed.
-Restore all participants and resolve native metadata/quorum errors first; a
-coordinated Pod restart may be needed to clear a native recovery latch. Keep the
-same PVCs, bootstrap ConfigMaps, and pending controller plan.
+The controller fences all participants before a transition and requires durable
+completion from each before reopening. Accepted intent is persisted before
+restart and recovered forward-only. Completion requires the exact pool map,
+active added pools, and native readiness, not completed healing. Established
+reachable nodes keep receiving leases when a peer is unavailable; RustFS
+decides data quorum, not an all-nodes Kuberic check.
 
-For a failed attempt with nonempty `decommissionInfo.unresolvedEntries`, the
-native recovery procedure is an explicit signed
-`POST /rustfs/admin/v3/pools/decommission?pool=0&by-id=true`. RustFS retains its
-progress and re-observes the unresolved entries. This is an operator action,
-not an automatic adapter retry. It can still fail if the underlying cause is
-unresolved. Other failed/canceled states need their own native recovery
-procedure; the example does not clear their metadata automatically. See the
-[pinned native decommission contract](https://github.com/rustfs/rustfs/blob/6de965ae3c965a78ff819fbcd7acd4aa44177d92/docs/architecture/decommission-compatibility.md).
+RustFS 1.0.1 can latch pool-metadata recovery after expansion. If coordinated
+maintenance is needed, publish a higher revision with all nodes,
+`enabled: false`, and no operations; wait for closed access everywhere. Stop
+both StatefulSets completely, retaining PVCs and bootstrap ConfigMaps, before
+restoring replicas. Wait for native `health.ready` in authenticated observations,
+not Pod readiness (which also requires authority), then enable a higher plan
+revision. Verify acknowledged objects and native read/write health.
 
-After all decommission receipts are complete, finalize the retired pool before
-testing further restarts: RustFS 1.0.1 rejects startup arguments that still
-contain a completed pool.
-
-1. Publish a higher revision with all eight nodes, `enabled: false`, and no
-   operations. Wait for the disabled plan to apply everywhere.
-2. Stop only the now-decommissioned A StatefulSet, retaining all four PVCs:
-   `kubectl -n rustfs-example scale statefulset/rfs-a --replicas=0`.
-3. Publish another higher revision containing only the four B control origins,
-   with `enabled: true` and a `finalizeDecommission` operation on each node.
-   For B0:
-
-```json
-{"id":"retire-8","request":{"kind":"finalizeDecommission","previous":{"pools":["http://rfs-a-{0...3}.rustfs-internal:9000/storage/data","http://rfs-b-{0...3}.rustfs-internal:9000/storage/data"],"local_node":"http://rfs-b-0.rustfs-internal:9000","erasure_set_drive_count":4},"target":{"pools":["http://rfs-b-{0...3}.rustfs-internal:9000/storage/data"],"local_node":"http://rfs-b-0.rustfs-internal:9000","erasure_set_drive_count":4},"decommission_id":"decommission-6"}}
-```
-
-Adjust both local origins for each B node. Do not use finalization on A nodes:
-they have no surviving local volumes. Wait for native completion on all B nodes,
-then verify the object inventory and surviving-node restart/rejoin behavior.
-Leave bootstrap configuration unchanged; the journal persists the reduced
-desired topology and the original decommission receipts. Do not restart the
-retired A StatefulSet or delete its storage as part of this procedure.
-
-### Isolated end-to-end suite
-
-Install PowerShell 7, Docker, kubectl, curl with AWS SigV4 support, and kind
-v0.33.0. The suite creates its own five-node kind cluster, kubeconfig, credentials,
-and NetworkPolicy-enforcing Calico installation. It never uses your current
-Kubernetes context. Allow substantial Docker memory and disk headroom for eight
-native processes and their persistent volumes; this is not a lightweight unit
-test.
-
-```powershell
-docker build --file .\kuberic-rustfs\Dockerfile --tag kuberic-rustfs:local .
-.\kuberic-rustfs\tests\e2e.ps1 -Kind kind -Image kuberic-rustfs:local
-```
-
-The harness checks distinct one-MiB object hashes, authenticated control,
-enforced native/control network isolation, lease expiry, unsafe topology and
-conflicting-ID rejection, native read/write health and S3 quorum outcomes,
-process and same-PVC Pod recovery, stale authority rejection, appended pools,
-coordinated native restart, interrupted native decommission, receipt-verified
-pool retirement, durable receipts, and surviving-worker rejoin.
-It requires actual inventory-bucket movement before interruption, not just
-movement of RustFS's small internal configuration objects. When interruption
-produces a retryable unresolved-entry failure, it checks fail-closed behavior
-and performs one explicit native operator recovery. It never clears native
-metadata to obtain a pass; unresolved failures still fail the suite.
-Quorum fault injection temporarily stops StatefulSet Pods while retaining the
-four-endpoint native configuration and PVCs, then restores all participants.
-This is a temporary outage test, not a supported topology scale-down operation.
-Native cluster read health includes lock and IAM readiness in addition to erasure
-read quorum. The test compares the adapter's read signal with the native endpoint
-instead of assuming that half the drives always produce HTTP 200.
-It cleans up only its own cluster, port-forwards, and temporary files. The CI
-workflow exposes the same suite through the opt-in `rustfs_e2e` dispatch input.
-
-kind workers share one physical host. These tests simulate process, Pod, and
-worker loss; they do not certify independent physical failure domains, disk
-power-loss durability, arbitrary network partitions, or completed native healing.
+Never shrink StatefulSets as a topology change, remove pool endpoints, erase
+journals, or delete native metadata to resolve a pending operation.

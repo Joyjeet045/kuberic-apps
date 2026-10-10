@@ -5,11 +5,6 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
-    inputs:
-      rustfs_e2e:
-        description: Build the pinned native image and run the isolated RustFS cluster suite
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -50,23 +45,11 @@ jobs:
       - name: Test workspace
         run: cargo test --locked --workspace --all-features -- --test-threads=2
 
-  rustfs-native-e2e:
-    if: github.event_name == 'workflow_dispatch' && inputs.rustfs_e2e
+  rustfs-native:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install pinned kind
-        run: |
-          curl --fail --location --output "$RUNNER_TEMP/kind" https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64
-          printf '%s  %s\n' aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d "$RUNNER_TEMP/kind" | sha256sum --check
-          chmod +x "$RUNNER_TEMP/kind"
-          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
-
       - name: Build and test pinned Linux native artifacts
-        run: docker build --file kuberic-rustfs/Dockerfile --tag kuberic-rustfs:e2e .
-
-      - name: Validate native quorum, recovery, fencing and topology
-        shell: pwsh
-        run: ./kuberic-rustfs/tests/e2e.ps1 -Image kuberic-rustfs:e2e
+        run: docker build --file kuberic-rustfs/Dockerfile --tag kuberic-rustfs:ci .

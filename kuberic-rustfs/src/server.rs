@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow};
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -194,7 +194,7 @@ async fn shutdown_signal() -> Result<()> {
         let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         tokio::select! {
             result = tokio::signal::ctrl_c() => result?,
-            value = term.recv() => ensure!(value.is_some(), "termination signal stream closed"),
+            value = term.recv() => anyhow::ensure!(value.is_some(), "termination signal stream closed"),
         }
     }
     #[cfg(not(unix))]
@@ -203,16 +203,17 @@ async fn shutdown_signal() -> Result<()> {
 }
 
 pub async fn serve(config: AdapterConfig) -> Result<()> {
-    let token = tokio::fs::read_to_string(&config.control_token_file).await?;
-    let token = token.trim();
-    ensure!(
-        token.len() >= 32
-            && token.len() <= 256
-            && token.bytes().all(|byte| byte.is_ascii_graphic()),
-        "control token must contain 32-256 non-whitespace ASCII characters"
-    );
+    let token = crate::config::control_token(&config.control_token_file).await?;
+    let tls = config.control_tls.load().await?;
     let client = TcpListener::bind(config.client_address).await?;
-    let control_listener = TcpListener::bind(config.control_address).await?;
+    let control_handle = axum_server::Handle::new();
+    let control_listener = axum_server::from_tcp_rustls(
+        TcpListener::bind(config.control_address)
+            .await?
+            .into_std()?,
+        tls,
+    )?
+    .handle(control_handle.clone());
     let adapter = Arc::new(RustfsAdapter::start(&config).await?);
     let operations = Arc::new(Semaphore::new(1));
     let router = Router::new()
@@ -229,7 +230,7 @@ pub async fn serve(config: AdapterConfig) -> Result<()> {
             operations: operations.clone(),
         });
     let result = tokio::select! {
-        result = axum::serve(control_listener, router) => {
+        result = control_listener.serve(router.into_make_service()) => {
             match result {
                 Ok(()) => Err(anyhow!("RustFS control listener stopped unexpectedly")),
                 Err(error) => Err(error.into()),
@@ -239,6 +240,7 @@ pub async fn serve(config: AdapterConfig) -> Result<()> {
         result = monitor(adapter.clone(), operations) => result,
         result = shutdown_signal() => result,
     };
+    control_handle.shutdown();
     let stopped = adapter.close().await;
     result?;
     stopped?;

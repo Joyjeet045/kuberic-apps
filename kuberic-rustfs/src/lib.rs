@@ -29,7 +29,7 @@ mod process;
 pub mod server;
 mod topology;
 
-pub use config::{BinaryPin, CredentialFiles, LaunchConfig};
+pub use config::{BinaryPin, ControlTlsConfig, CredentialFiles, LaunchConfig, NativeTlsConfig};
 pub use process::{ExitReport, RunningRustfs};
 pub use topology::Topology;
 
@@ -69,6 +69,15 @@ impl HealthClient {
     /// Use a direct S3-listener origin (not a console or load-balancer URL).
     /// Redirects and environment proxies are disabled to preserve the target node.
     pub fn new(endpoint: &str, timeout: Duration) -> Result<Self> {
+        Self::build(endpoint, timeout, None)
+    }
+
+    /// Observe an HTTPS node using only the supplied PEM CA bundle.
+    pub fn with_ca_bundle(endpoint: &str, timeout: Duration, ca: &[u8]) -> Result<Self> {
+        Self::build(endpoint, timeout, Some(ca))
+    }
+
+    fn build(endpoint: &str, timeout: Duration, ca: Option<&[u8]>) -> Result<Self> {
         let endpoint = Url::parse(endpoint).context("invalid RustFS health endpoint URL")?;
         ensure!(
             matches!(endpoint.scheme(), "http" | "https")
@@ -87,12 +96,20 @@ impl HealthClient {
             "RustFS health timeout exceeds the supported deadline range"
         );
 
-        let client = Client::builder()
+        let mut client = Client::builder()
             .timeout(timeout)
             .connect_timeout(timeout)
             .redirect(Policy::none())
             .retry(reqwest::retry::never())
-            .no_proxy()
+            .no_proxy();
+        if let Some(ca) = ca {
+            ensure!(
+                endpoint.scheme() == "https",
+                "a private CA requires an HTTPS endpoint"
+            );
+            client = config::trust_ca(client, ca)?;
+        }
+        let client = client
             .build()
             .context("failed to build RustFS health client")?;
         Ok(Self { client, endpoint })

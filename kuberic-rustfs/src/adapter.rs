@@ -13,15 +13,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::Mutex;
 
-use crate::admin::{AdminClient, validate_decommission_receipt};
+use crate::admin::AdminClient;
 use crate::journal::Journal;
 use crate::topology::{
-    expansion_volumes, prepare_expansion, prepare_retirement, recorded_topology,
-    validate_expansion, validate_retirement,
+    expansion_volumes, prepare_expansion, recorded_topology, validate_expansion,
 };
 use crate::{
-    BinaryPin, CredentialFiles, HealthClient, HealthProbe, HealthStatus, LaunchConfig,
-    RunningRustfs, Topology,
+    BinaryPin, ControlTlsConfig, CredentialFiles, HealthClient, HealthProbe, HealthStatus,
+    LaunchConfig, NativeTlsConfig, RunningRustfs, Topology,
 };
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -32,10 +31,12 @@ pub struct AdapterConfig {
     pub credentials: CredentialFiles,
     pub state_directory: PathBuf,
     pub topology: Topology,
+    pub native_tls: Option<NativeTlsConfig>,
     pub native_address: SocketAddr,
     pub client_address: SocketAddr,
     pub control_address: SocketAddr,
     pub control_token_file: PathBuf,
+    pub control_tls: ControlTlsConfig,
     pub shutdown_grace_seconds: u64,
 }
 
@@ -48,15 +49,6 @@ pub enum TopologyOperation {
     Expand {
         previous: Topology,
         target: Topology,
-    },
-    Decommission {
-        topology: Topology,
-        pool: usize,
-    },
-    FinalizeDecommission {
-        previous: Topology,
-        target: Topology,
-        decommission_id: String,
     },
 }
 
@@ -83,6 +75,10 @@ fn native_error(error: anyhow::Error) -> NativeError {
 impl RustfsAdapter {
     pub async fn start(config: &AdapterConfig) -> Result<Self> {
         ensure!(
+            config.native_tls.is_some() || config.client_address.ip().is_loopback(),
+            "native TLS is required for a non-loopback client gateway"
+        );
+        ensure!(
             config.client_address.port() != 0
                 && config.control_address.port() != 0
                 && config.client_address.port() != config.native_address.port()
@@ -96,6 +92,16 @@ impl RustfsAdapter {
             "adapter state directory must exist, be absolute, and not be a symlink"
         );
         let root = fs::canonicalize(&config.state_directory)?;
+        let mut launch = LaunchConfig {
+            binary: BinaryPin::new(config.binary.clone(), &config.sha256)?,
+            credentials: config.credentials.clone(),
+            state_directory: root.join("engine"),
+            topology: config.topology.clone(),
+            native_tls: config.native_tls.clone(),
+            address: config.native_address,
+            shutdown_grace: Duration::from_secs(config.shutdown_grace_seconds),
+        };
+        launch.validate()?;
         let lock_path = root.join("adapter.lock");
         if lock_path.try_exists()? {
             ensure!(
@@ -118,29 +124,35 @@ impl RustfsAdapter {
             );
         }
         let journal = Journal::open(&journal_path, &config.topology)?;
+        if let Some(pending) = journal.pending()? {
+            serde_json::from_value::<TopologyOperation>(pending.request)
+                .context("journal contains an unsupported pending topology operation")?;
+        }
         let topology = journal.topology()?;
         let engine = root.join("engine");
         if !engine.try_exists()? {
             fs::create_dir(&engine)?;
         }
         prepare_topology(&engine, &journal, &topology)?;
-        let launch = LaunchConfig {
-            binary: BinaryPin::new(config.binary.clone(), &config.sha256)?,
-            credentials: config.credentials.clone(),
-            state_directory: engine,
-            topology,
-            address: config.native_address,
-            shutdown_grace: Duration::from_secs(config.shutdown_grace_seconds),
-        };
+        launch.topology = topology;
         let ip = match config.native_address.ip() {
             IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
             IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
             ip => ip,
         };
         let upstream = SocketAddr::new(ip, config.native_address.port());
-        let endpoint = format!("http://{upstream}");
-        let health = HealthClient::new(&endpoint, Duration::from_secs(2))?;
-        let admin = AdminClient::new(&endpoint, config.credentials.clone())?;
+        let ca = config
+            .native_tls
+            .as_ref()
+            .map(NativeTlsConfig::ca_bundle)
+            .transpose()?;
+        let scheme = if ca.is_some() { "https" } else { "http" };
+        let endpoint = format!("{scheme}://{upstream}");
+        let health = match &ca {
+            Some(ca) => HealthClient::with_ca_bundle(&endpoint, Duration::from_secs(2), ca)?,
+            None => HealthClient::new(&endpoint, Duration::from_secs(2))?,
+        };
+        let admin = AdminClient::new(&endpoint, config.credentials.clone(), ca.as_deref())?;
         let process = RunningRustfs::start(launch.clone()).await?;
         Ok(Self {
             state: Mutex::new(State {
@@ -243,21 +255,7 @@ impl RustfsAdapter {
                 }
                 Some(target)
             }
-            TopologyOperation::FinalizeDecommission {
-                previous,
-                target,
-                decommission_id,
-            } => {
-                let pool = completed_pool(&state.journal, previous, decommission_id)?;
-                validate_retirement(previous, target, pool)?;
-                ensure!(
-                    desired == *previous || desired == *target,
-                    "retirement source does not match the established topology"
-                );
-                Some(target)
-            }
-            TopologyOperation::Restart { topology }
-            | TopologyOperation::Decommission { topology, .. } => {
+            TopologyOperation::Restart { topology } => {
                 ensure!(
                     desired == *topology,
                     "operation topology does not match storage"
@@ -265,12 +263,6 @@ impl RustfsAdapter {
                 None
             }
         };
-        if let TopologyOperation::Decommission { topology, pool } = &request {
-            ensure!(
-                topology.pools.len() > 1 && *pool < topology.pools.len(),
-                "decommission requires an existing pool in a multi-pool topology"
-            );
-        }
         if let complete @ NativeOperationStatus::Complete { .. } =
             state.journal.accept(operation, new_topology)?
         {
@@ -302,65 +294,25 @@ impl RustfsAdapter {
                 }),
             "native pool identity does not yet match the requested ordered topology"
         );
-        let evidence = match request {
-            TopologyOperation::Decommission { pool, .. } => {
-                let Some(evidence) = self.admin.decommission(pool).await? else {
-                    return Ok(NativeOperationStatus::Pending);
-                };
-                evidence
-            }
-            TopologyOperation::Expand { .. }
-            | TopologyOperation::Restart { .. }
-            | TopologyOperation::FinalizeDecommission { .. } => {
-                if let TopologyOperation::Expand { previous, .. } = &request
-                    && pools[previous.pools.len()..]
-                        .iter()
-                        .any(|pool| pool.status != "active")
-                {
-                    return Ok(NativeOperationStatus::Pending);
-                }
-                if matches!(request, TopologyOperation::FinalizeDecommission { .. })
-                    && pools.iter().any(|pool| pool.status != "active")
-                {
-                    return Ok(NativeOperationStatus::Pending);
-                }
-                if self.health.probe(HealthProbe::Readiness).await? != HealthStatus::Healthy {
-                    return Ok(NativeOperationStatus::Pending);
-                }
-                json!({
-                    "poolArguments": target.pools,
-                    "poolStatus": pools.iter().map(|pool| &pool.status).collect::<Vec<_>>(),
-                    "processId": state.process.as_ref().context("missing native process")?.id(),
-                    "nodeReady": true
-                })
-            }
-        };
+        if let TopologyOperation::Expand { previous, .. } = &request
+            && pools[previous.pools.len()..]
+                .iter()
+                .any(|pool| pool.status != "active")
+        {
+            return Ok(NativeOperationStatus::Pending);
+        }
+        if self.health.probe(HealthProbe::Readiness).await? != HealthStatus::Healthy {
+            return Ok(NativeOperationStatus::Pending);
+        }
+        let evidence = json!({
+            "poolArguments": target.pools,
+            "poolStatus": pools.iter().map(|pool| &pool.status).collect::<Vec<_>>(),
+            "processId": state.process.as_ref().context("missing native process")?.id(),
+            "nodeReady": true
+        });
         state.journal.complete(&operation.id, &evidence)?;
         Ok(NativeOperationStatus::Complete { evidence })
     }
-}
-
-fn completed_pool(journal: &Journal, previous: &Topology, id: &str) -> Result<usize> {
-    let (operation, evidence) = journal.completed_operation(id)?;
-    let TopologyOperation::Decommission { topology, pool } =
-        serde_json::from_value(operation.request)?
-    else {
-        anyhow::bail!("retirement receipt is not for a decommission operation");
-    };
-    ensure!(
-        topology == *previous,
-        "retirement receipt is for a different topology"
-    );
-    validate_decommission_receipt(&evidence)?;
-    ensure!(
-        evidence.get("id").and_then(serde_json::Value::as_u64) == Some(pool as u64)
-            && previous.pools.get(pool).is_some_and(|cmdline| {
-                evidence.get("cmdline").and_then(serde_json::Value::as_str)
-                    == Some(cmdline.as_str())
-            }),
-        "native retirement evidence does not identify the completed pool"
-    );
-    Ok(pool)
 }
 
 fn prepare_topology(directory: &Path, journal: &Journal, target: &Topology) -> Result<()> {
@@ -375,14 +327,6 @@ fn prepare_topology(directory: &Path, journal: &Journal, target: &Topology) -> R
             previous,
             target: requested,
         } if previous == recorded && requested == *target => prepare_expansion(directory, target),
-        TopologyOperation::FinalizeDecommission {
-            previous,
-            target: requested,
-            decommission_id,
-        } if previous == recorded && requested == *target => {
-            let pool = completed_pool(journal, &previous, &decommission_id)?;
-            prepare_retirement(directory, &previous, target, pool)
-        }
         _ => anyhow::bail!("recorded topology does not match the durable transition"),
     }
 }
@@ -447,8 +391,40 @@ mod tests {
     use super::*;
     use crate::topology::TopologyLease;
 
+    #[tokio::test]
+    async fn invalid_bootstrap_does_not_poison_the_adapter_journal() {
+        let root = tempfile::tempdir().unwrap();
+        let config = AdapterConfig {
+            binary: std::env::current_exe().unwrap(),
+            sha256: "0".repeat(64),
+            credentials: CredentialFiles {
+                access_key: root.path().join("access"),
+                secret_key: root.path().join("secret"),
+            },
+            state_directory: root.path().to_owned(),
+            topology: Topology {
+                pools: Vec::new(),
+                local_node: None,
+                erasure_set_drive_count: None,
+            },
+            native_tls: None,
+            native_address: "127.0.0.1:9000".parse().unwrap(),
+            client_address: "127.0.0.1:9002".parse().unwrap(),
+            control_address: "127.0.0.1:9003".parse().unwrap(),
+            control_token_file: root.path().join("token"),
+            control_tls: ControlTlsConfig {
+                certificate_file: root.path().join("tls.crt"),
+                private_key_file: root.path().join("tls.key"),
+            },
+            shutdown_grace_seconds: 3,
+        };
+        assert!(RustfsAdapter::start(&config).await.is_err());
+        assert!(!root.path().join("adapter.sqlite").exists());
+        assert!(!root.path().join("engine").exists());
+    }
+
     #[test]
-    fn retirement_requires_matching_completion_and_recovers_without_deleting_storage() {
+    fn expansion_recovers_accepted_intent_without_deleting_storage() {
         let root = tempfile::tempdir().unwrap();
         let engine = root.path().join("engine");
         fs::create_dir(&engine).unwrap();
@@ -456,49 +432,22 @@ mod tests {
             fs::create_dir(root.path().join(format!("data{index}"))).unwrap();
         }
         let previous = Topology {
-            pools: vec![
-                format!("{}{{1...2}}", root.path().join("data").display()),
-                format!("{}{{3...4}}", root.path().join("data").display()),
-            ],
+            pools: vec![format!("{}{{1...2}}", root.path().join("data").display())],
             local_node: None,
             erasure_set_drive_count: Some(2),
         };
         let target = Topology {
-            pools: previous.pools[1..].to_vec(),
+            pools: vec![
+                previous.pools[0].clone(),
+                format!("{}{{3...4}}", root.path().join("data").display()),
+            ],
             ..previous.clone()
         };
         drop(TopologyLease::acquire(&engine, &previous).unwrap());
-        let retired_data = root.path().join("data1").join("sentinel");
-        let surviving_data = root.path().join("data3").join("sentinel");
-        fs::write(&retired_data, b"retained").unwrap();
-        fs::write(&surviving_data, b"surviving").unwrap();
+        let data = root.path().join("data1").join("sentinel");
+        fs::write(&data, b"retained").unwrap();
         let path = root.path().join("adapter.sqlite");
         let mut journal = Journal::open(&path, &previous).unwrap();
-        let decommission = NativeOperation {
-            id: "drain".into(),
-            request: serde_json::to_value(TopologyOperation::Decommission {
-                topology: previous.clone(),
-                pool: 0,
-            })
-            .unwrap(),
-        };
-        assert!(completed_pool(&journal, &previous, &decommission.id).is_err());
-        journal.accept(&decommission, None).unwrap();
-        assert!(completed_pool(&journal, &previous, &decommission.id).is_err());
-        let evidence = json!({
-            "id": 0, "cmdline": previous.pools[0],
-            "status": "complete", "poolStatus": "decommissioned",
-            "decommissionInfo": {
-                "complete": true, "failed": false, "canceled": false,
-                "objectsDecommissionedFailed": 0, "bytesDecommissionedFailed": 0
-            }
-        });
-        journal.complete(&decommission.id, &evidence).unwrap();
-        assert_eq!(
-            completed_pool(&journal, &previous, &decommission.id).unwrap(),
-            0
-        );
-        assert!(completed_pool(&journal, &target, &decommission.id).is_err());
         let restart = NativeOperation {
             id: "restart".into(),
             request: serde_json::to_value(TopologyOperation::Restart {
@@ -510,35 +459,16 @@ mod tests {
         journal
             .complete(&restart.id, &json!({"nodeReady": true}))
             .unwrap();
-        assert!(completed_pool(&journal, &previous, &restart.id).is_err());
-        let malformed = NativeOperation {
-            id: "malformed".into(),
-            request: decommission.request.clone(),
-        };
-        journal.accept(&malformed, None).unwrap();
-        journal
-            .complete(&malformed.id, &json!({"status": "complete"}))
-            .unwrap();
-        assert!(completed_pool(&journal, &previous, &malformed.id).is_err());
-        let wrong_pool = NativeOperation {
-            id: "wrong-pool".into(),
-            request: decommission.request.clone(),
-        };
-        let mut wrong_evidence = evidence.clone();
-        wrong_evidence["cmdline"] = json!(previous.pools[1]);
-        journal.accept(&wrong_pool, None).unwrap();
-        journal.complete(&wrong_pool.id, &wrong_evidence).unwrap();
-        assert!(completed_pool(&journal, &previous, &wrong_pool.id).is_err());
-        let finalize = NativeOperation {
-            id: "retire".into(),
-            request: serde_json::to_value(TopologyOperation::FinalizeDecommission {
+        assert!(prepare_topology(&engine, &journal, &target).is_err());
+        let expand = NativeOperation {
+            id: "expand".into(),
+            request: serde_json::to_value(TopologyOperation::Expand {
                 previous: previous.clone(),
                 target: target.clone(),
-                decommission_id: decommission.id.clone(),
             })
             .unwrap(),
         };
-        journal.accept(&finalize, Some(&target)).unwrap();
+        journal.accept(&expand, Some(&target)).unwrap();
         let lease = TopologyLease::acquire(&engine, &previous).unwrap();
         assert!(prepare_topology(&engine, &journal, &target).is_err());
         assert_eq!(recorded_topology(&engine).unwrap(), Some(previous.clone()));
@@ -549,12 +479,26 @@ mod tests {
         prepare_topology(&engine, &journal, &target).unwrap();
         assert_eq!(recorded_topology(&engine).unwrap(), Some(target.clone()));
         drop(TopologyLease::acquire(&engine, &target).unwrap());
-        assert_eq!(journal.pending().unwrap(), Some(finalize));
+        assert_eq!(journal.pending().unwrap(), Some(expand));
         assert_eq!(
-            journal.lookup(&decommission).unwrap(),
-            Some(NativeOperationStatus::Complete { evidence })
+            journal.lookup(&restart).unwrap(),
+            Some(NativeOperationStatus::Complete {
+                evidence: json!({"nodeReady": true})
+            })
         );
-        assert_eq!(fs::read(retired_data).unwrap(), b"retained");
-        assert_eq!(fs::read(surviving_data).unwrap(), b"surviving");
+        assert_eq!(fs::read(data).unwrap(), b"retained");
+        assert!(
+            fs::read_dir(root.path().join("data3"))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn unsupported_pool_removal_operations_are_rejected() {
+        for kind in ["decommission", "finalizeDecommission", "shrink"] {
+            assert!(serde_json::from_value::<TopologyOperation>(json!({"kind": kind})).is_err());
+        }
     }
 }

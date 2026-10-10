@@ -17,6 +17,21 @@ fn derives_local_volumes_without_reordering_pools_or_ranges() {
 }
 
 #[test]
+fn https_topology_preserves_paths_and_rejects_mixed_schemes() {
+    let mut topology = Topology {
+        pools: vec!["https://node{1...4}:9000/data".into()],
+        local_node: Some("https://node2:9000".into()),
+        erasure_set_drive_count: Some(4),
+    };
+    assert_eq!(
+        topology.local_volumes().unwrap(),
+        [std::path::PathBuf::from("/data")]
+    );
+    topology.pools.push("http://other{1...4}:9000/data".into());
+    assert!(topology.local_volumes().is_err());
+}
+
+#[test]
 fn rejects_unsafe_or_unsupported_topologies() {
     for (pools, node, width) in [
         (vec![], None, None),

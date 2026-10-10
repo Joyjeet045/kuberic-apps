@@ -10,7 +10,7 @@ use kuberic_native_runtime::native::{
     NativeApplication, NativeAuthority, NativeOperation, NativeOperationStatus,
 };
 use kuberic_rustfs::adapter::{AdapterConfig, RustfsAdapter, TopologyOperation};
-use kuberic_rustfs::{CredentialFiles, Topology};
+use kuberic_rustfs::{ControlTlsConfig, CredentialFiles, NativeTlsConfig, Topology};
 use reqwest::{Client, Method};
 use sha2::{Digest, Sha256};
 
@@ -21,7 +21,7 @@ async fn s3(
     path: &str,
     body: &[u8],
 ) -> Result<Vec<u8>> {
-    let url = format!("http://{endpoint}{path}");
+    let url = format!("https://{endpoint}{path}");
     let identity = Credentials::new(
         "adapter-test",
         "adapter-test-secret-value",
@@ -100,6 +100,18 @@ async fn native_adapter_fences_restarts_replays_and_retains_acknowledged_objects
     };
     fs::write(&credentials.access_key, "adapter-test")?;
     fs::write(&credentials.secret_key, "adapter-test-secret-value")?;
+    let tls_directory = root.path().join("tls");
+    fs::create_dir(&tls_directory)?;
+    let certificate = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()])?;
+    fs::write(
+        tls_directory.join("rustfs_cert.pem"),
+        certificate.cert.pem(),
+    )?;
+    fs::write(tls_directory.join("ca.crt"), certificate.cert.pem())?;
+    fs::write(
+        tls_directory.join("rustfs_key.pem"),
+        certificate.signing_key.serialize_pem(),
+    )?;
     let native_listener = TcpListener::bind("127.0.0.1:0")?;
     let client_listener = TcpListener::bind("127.0.0.1:0")?;
     let control_listener = TcpListener::bind("127.0.0.1:0")?;
@@ -109,6 +121,9 @@ async fn native_adapter_fences_restarts_replays_and_retains_acknowledged_objects
             .into(),
         sha256: std::env::var("KUBERIC_RUSTFS_TEST_SHA256")?,
         credentials,
+        native_tls: Some(NativeTlsConfig {
+            directory: tls_directory,
+        }),
         state_directory: state,
         topology: Topology {
             pools: vec![volume.to_str().context("non-UTF8 test path")?.into()],
@@ -119,10 +134,19 @@ async fn native_adapter_fences_restarts_replays_and_retains_acknowledged_objects
         client_address: client_listener.local_addr()?,
         control_address: control_listener.local_addr()?,
         control_token_file: root.path().join("token"),
+        control_tls: ControlTlsConfig {
+            certificate_file: root.path().join("tls.crt"),
+            private_key_file: root.path().join("tls.key"),
+        },
         shutdown_grace_seconds: 3,
     };
     let client = Client::builder()
         .no_proxy()
+        .https_only(true)
+        .tls_built_in_root_certs(false)
+        .add_root_certificate(reqwest::Certificate::from_pem(
+            certificate.cert.pem().as_bytes(),
+        )?)
         .timeout(Duration::from_secs(10))
         .build()?;
     drop(native_listener);

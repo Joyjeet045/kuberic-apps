@@ -20,7 +20,7 @@ const INHERITED_LOCK: &[u8] = b"kuberic-rustfs-inherited-flock-v1\n";
 #[serde(deny_unknown_fields)]
 pub struct Topology {
     pub pools: Vec<String>,
-    /// Direct HTTP origin identifying this node in distributed pool arguments.
+    /// Direct HTTP(S) origin identifying this node in distributed pool arguments.
     /// `None` selects local-directory pool arguments.
     pub local_node: Option<String>,
     pub erasure_set_drive_count: Option<u16>,
@@ -42,7 +42,7 @@ impl Topology {
         }
         let node = self.local_node.as_deref().map(http_endpoint).transpose()?;
         if let Some(node) = &node {
-            ensure!(node.path() == "/", "local node must be an HTTP origin");
+            ensure!(node.path() == "/", "local node must be an HTTP(S) origin");
         }
         let mut endpoints = BTreeSet::new();
         let mut local = Vec::new();
@@ -65,6 +65,10 @@ impl Topology {
             for endpoint in expanded {
                 let path = if let Some(node) = &node {
                     let url = http_endpoint(&endpoint)?;
+                    ensure!(
+                        url.scheme() == node.scheme(),
+                        "native endpoint schemes must match"
+                    );
                     ensure!(
                         url.path() != "/",
                         "distributed endpoint needs a volume path"
@@ -110,14 +114,14 @@ fn http_endpoint(value: &str) -> Result<Url> {
     );
     let url = Url::parse(value).context("invalid RustFS endpoint")?;
     ensure!(
-        url.scheme() == "http"
+        matches!(url.scheme(), "http" | "https")
             && url.host_str().is_some()
             && url.port() != Some(0)
             && url.username().is_empty()
             && url.password().is_none()
             && url.query().is_none()
             && url.fragment().is_none(),
-        "RustFS process topology requires HTTP endpoints without credentials, query, or fragment"
+        "RustFS process topology requires HTTP(S) endpoints without credentials, query, or fragment"
     );
     ensure!(
         !value.split('/').any(|part| matches!(part, "." | "..")),
@@ -358,50 +362,6 @@ pub(crate) fn prepare_expansion(directory: &Path, target: &Topology) -> Result<(
     persist_topology(&lease.directory, target, volumes)
 }
 
-pub(crate) fn validate_retirement(
-    previous: &Topology,
-    target: &Topology,
-    pool: usize,
-) -> Result<()> {
-    previous.local_volumes()?;
-    target.local_volumes()?;
-    ensure!(
-        pool < previous.pools.len()
-            && previous.pools.len() == target.pools.len() + 1
-            && previous
-                .pools
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| *index != pool)
-                .map(|(_, pool)| pool)
-                .eq(&target.pools)
-            && previous.local_node == target.local_node
-            && previous.erasure_set_drive_count == target.erasure_set_drive_count,
-        "retirement must remove exactly the completed pool and preserve surviving identities"
-    );
-    Ok(())
-}
-
-pub(crate) fn prepare_retirement(
-    directory: &Path,
-    previous: &Topology,
-    target: &Topology,
-    pool: usize,
-) -> Result<()> {
-    validate_retirement(previous, target, pool)?;
-    ensure!(
-        recorded_topology(directory)?.as_ref() == Some(previous),
-        "retirement source does not match the recorded topology"
-    );
-    let lease = TopologyLease::acquire(directory, previous)?;
-    let volumes = target
-        .local_volumes()?
-        .iter()
-        .map(|path| existing_directory(path))
-        .collect::<Result<Vec<_>>>()?;
-    persist_topology(&lease.directory, target, volumes)
-}
-
 fn persist_topology(directory: &Path, target: &Topology, volumes: Vec<PathBuf>) -> Result<()> {
     let record = Record {
         schema_version: 1,
@@ -485,48 +445,6 @@ mod tests {
             local_node: None,
             erasure_set_drive_count: Some(2),
         }
-    }
-
-    #[test]
-    fn retirement_rejects_unproved_pool_removal_and_survivor_changes() {
-        let root = tempfile::tempdir().unwrap();
-        let previous = Topology {
-            pools: vec![
-                format!("{}{{1...2}}", root.path().join("data").display()),
-                format!("{}{{3...4}}", root.path().join("data").display()),
-                format!("{}{{5...6}}", root.path().join("data").display()),
-            ],
-            local_node: None,
-            erasure_set_drive_count: Some(2),
-        };
-        let mut target = previous.clone();
-        target.pools.remove(1);
-        validate_retirement(&previous, &target, 1).unwrap();
-        assert!(validate_retirement(&previous, &target, 0).is_err());
-        assert!(validate_retirement(&previous, &target, 3).is_err());
-        assert!(validate_retirement(&previous, &previous, 1).is_err());
-        let mut changed = target.clone();
-        changed.pools.reverse();
-        assert!(validate_retirement(&previous, &changed, 1).is_err());
-        changed = target.clone();
-        changed.pools.remove(0);
-        assert!(validate_retirement(&previous, &changed, 1).is_err());
-        changed = target;
-        changed.erasure_set_drive_count = None;
-        assert!(validate_retirement(&previous, &changed, 1).is_err());
-        let distributed = Topology {
-            pools: vec![
-                "http://a{0...3}:9000/data".into(),
-                "http://b{0...3}:9000/data".into(),
-            ],
-            local_node: Some("http://a0:9000".into()),
-            erasure_set_drive_count: Some(4),
-        };
-        let survivor = Topology {
-            pools: distributed.pools[1..].to_vec(),
-            ..distributed.clone()
-        };
-        assert!(validate_retirement(&distributed, &survivor, 0).is_err());
     }
 
     #[test]

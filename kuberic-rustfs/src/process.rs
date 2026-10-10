@@ -299,6 +299,7 @@ mod tests {
                 erasure_set_drive_count: None,
             },
             address: "127.0.0.1:19000".parse().unwrap(),
+            native_tls: None,
             shutdown_grace: Duration::from_millis(100),
         }
     }
@@ -403,6 +404,45 @@ mod tests {
 
     fn config_for(root: &Path) -> LaunchConfig {
         config(root)
+    }
+
+    #[test]
+    fn native_tls_is_validated_and_required_off_loopback() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = config(root.path());
+        config.address = "0.0.0.0:19000".parse().unwrap();
+        assert!(config.validate().is_err());
+        let tls = root.path().join("tls");
+        fs::create_dir(&tls).unwrap();
+        config.native_tls = Some(crate::NativeTlsConfig {
+            directory: tls.clone(),
+        });
+        assert!(config.validate().is_err());
+        let certificate = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+        fs::write(tls.join("rustfs_cert.pem"), certificate.cert.pem()).unwrap();
+        fs::write(tls.join("ca.crt"), certificate.cert.pem()).unwrap();
+        fs::write(
+            tls.join("rustfs_key.pem"),
+            certificate.signing_key.serialize_pem(),
+        )
+        .unwrap();
+        config.validate().unwrap();
+        let command = config.command(&std::env::current_exe().unwrap());
+        assert!(
+            command
+                .get_envs()
+                .any(|(name, value)| name == "RUSTFS_TLS_PATH" && value == Some(tls.as_os_str()))
+        );
+        fs::write(tls.join("ca.crt"), "").unwrap();
+        assert!(config.validate().is_err());
+        fs::write(tls.join("ca.crt"), certificate.cert.pem()).unwrap();
+        let different = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+        fs::write(
+            tls.join("rustfs_key.pem"),
+            different.signing_key.serialize_pem(),
+        )
+        .unwrap();
+        assert!(config.validate().is_err());
     }
 
     #[cfg(target_os = "linux")]

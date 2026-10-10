@@ -14,11 +14,13 @@ async-trait.workspace = true
 aws-credential-types = "1"
 aws-sigv4 = "1"
 axum.workspace = true
+axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
 fs2.workspace = true
 kuberic-native-runtime.workspace = true
 kuberic-controller.workspace = true
 reqwest = { workspace = true, features = ["json"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -28,6 +30,9 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true
 subtle = "2"
+
+[dev-dependencies]
+rcgen = "0.14"
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["process", "fs"] }

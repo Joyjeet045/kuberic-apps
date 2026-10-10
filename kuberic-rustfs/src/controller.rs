@@ -17,6 +17,7 @@ use crate::HealthClient;
 #[serde(deny_unknown_fields)]
 pub struct ControllerConfig {
     pub token_file: PathBuf,
+    pub ca_certificate_file: PathBuf,
     pub plan: NativePlan,
 }
 
@@ -26,6 +27,31 @@ struct NodeApi {
 }
 
 impl NodeApi {
+    async fn new(config: &ControllerConfig) -> Result<Self> {
+        ensure!(
+            (5_000..=30_000).contains(&config.plan.lease_millis),
+            "controller leases must be between 5000 and 30000 milliseconds"
+        );
+        for node in &config.plan.nodes {
+            HealthClient::new(&node.node, Duration::from_secs(10))?;
+            ensure!(
+                reqwest::Url::parse(&node.node)?.scheme() == "https",
+                "native control origins must use HTTPS"
+            );
+        }
+        let ca = tokio::fs::read(&config.ca_certificate_file).await?;
+        let client = Client::builder()
+            .timeout(Duration::from_millis(config.plan.lease_millis / 4))
+            .connect_timeout(Duration::from_secs(2))
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .no_proxy();
+        Ok(Self {
+            client: crate::config::trust_ca(client, &ca)?.build()?,
+            token: crate::config::control_token(&config.token_file).await?,
+        })
+    }
+
     async fn request<T: Serialize + Sync, R: DeserializeOwned>(
         &self,
         node: &str,
@@ -102,25 +128,7 @@ impl NativeNodeApi for NodeApi {
 }
 
 pub async fn reconcile_once(config: &ControllerConfig) -> Result<NativePlanStatus> {
-    ensure!(
-        (5_000..=30_000).contains(&config.plan.lease_millis),
-        "controller leases must be between 5000 and 30000 milliseconds"
-    );
-    for node in &config.plan.nodes {
-        HealthClient::new(&node.node, Duration::from_secs(10))?;
-    }
-    let token = tokio::fs::read_to_string(&config.token_file).await?;
-    ensure!(!token.trim().is_empty(), "native control token is empty");
-    let api = NodeApi {
-        client: Client::builder()
-            .timeout(Duration::from_millis(config.plan.lease_millis / 4))
-            .connect_timeout(Duration::from_secs(2))
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .no_proxy()
-            .build()?,
-        token: token.trim().into(),
-    };
+    let api = NodeApi::new(config).await?;
     reconcile(&api, &config.plan).await.map_err(Into::into)
 }
 
@@ -178,6 +186,142 @@ mod tests {
 
     use super::*;
 
+    fn test_tls(root: &Path, name: &str) -> crate::ControlTlsConfig {
+        let certificate = rcgen::generate_simple_self_signed(vec![name.into()]).unwrap();
+        let config = crate::ControlTlsConfig {
+            certificate_file: root.join("tls.crt"),
+            private_key_file: root.join("tls.key"),
+        };
+        std::fs::write(&config.certificate_file, certificate.cert.pem()).unwrap();
+        std::fs::write(
+            &config.private_key_file,
+            certificate.signing_key.serialize_pem(),
+        )
+        .unwrap();
+        config
+    }
+
+    struct TestNode {
+        origin: String,
+        handle: axum_server::Handle<std::net::SocketAddr>,
+    }
+
+    impl Drop for TestNode {
+        fn drop(&mut self) {
+            self.handle.shutdown();
+        }
+    }
+
+    async fn test_node(tls: &crate::ControlTlsConfig, router: Router) -> TestNode {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("https://{}", listener.local_addr().unwrap());
+        let handle = axum_server::Handle::new();
+        let server =
+            axum_server::from_tcp_rustls(listener.into_std().unwrap(), tls.load().await.unwrap())
+                .unwrap()
+                .handle(handle.clone());
+        tokio::spawn(async move { server.serve(router.into_make_service()).await.unwrap() });
+        TestNode { origin, handle }
+    }
+
+    fn test_config(root: &Path, ca: PathBuf, nodes: Vec<NativeNodePlan>) -> ControllerConfig {
+        let token_file = root.join("token");
+        std::fs::write(&token_file, "controller-test-token-with-32-characters").unwrap();
+        ControllerConfig {
+            token_file,
+            ca_certificate_file: ca,
+            plan: NativePlan {
+                revision: 1,
+                enabled: true,
+                lease_millis: 5000,
+                nodes,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn control_transport_rejects_plaintext_untrusted_certificates_and_wrong_names() {
+        let root = tempfile::tempdir().unwrap();
+        let tls = test_tls(root.path(), "127.0.0.1");
+        let node = test_node(
+            &tls,
+            Router::new().route("/probe", get(|| async { Json(true) })),
+        )
+        .await;
+        let mut config = test_config(
+            root.path(),
+            tls.certificate_file.clone(),
+            vec![NativeNodePlan {
+                node: node.origin.clone(),
+                operation: None,
+            }],
+        );
+        let api = NodeApi::new(&config).await.unwrap();
+        let result: bool = api
+            .request::<(), _>(&node.origin, "/probe", Method::GET, None)
+            .await
+            .unwrap();
+        assert!(result);
+
+        let plaintext = node.origin.replacen("https:", "http:", 1);
+        assert!(
+            api.request::<(), bool>(&plaintext, "/probe", Method::GET, None)
+                .await
+                .is_err()
+        );
+        config.plan.nodes[0].node = plaintext.clone();
+        assert!(
+            NodeApi::new(&config)
+                .await
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("HTTPS")
+        );
+        assert!(
+            Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .unwrap()
+                .get(plaintext)
+                .send()
+                .await
+                .is_err(),
+            "TLS listener accepted plaintext"
+        );
+        config.plan.nodes[0].node = node.origin.clone();
+
+        let other = tempfile::tempdir().unwrap();
+        config.ca_certificate_file = test_tls(other.path(), "127.0.0.1").certificate_file;
+        let untrusted = NodeApi::new(&config).await.unwrap();
+        assert!(
+            untrusted
+                .request::<(), bool>(&node.origin, "/probe", Method::GET, None)
+                .await
+                .is_err()
+        );
+
+        let wrong_name = test_tls(other.path(), "wrong.example");
+        let wrong_node = test_node(
+            &wrong_name,
+            Router::new().route("/probe", get(|| async { Json(true) })),
+        )
+        .await;
+        config.ca_certificate_file = wrong_name.certificate_file;
+        config.plan.nodes[0].node = wrong_node.origin.clone();
+        let wrong = NodeApi::new(&config).await.unwrap();
+        assert!(
+            wrong
+                .request::<(), bool>(&wrong_node.origin, "/probe", Method::GET, None)
+                .await
+                .is_err()
+        );
+
+        std::fs::write(&config.ca_certificate_file, "").unwrap();
+        assert!(NodeApi::new(&config).await.is_err());
+    }
+
     #[tokio::test]
     async fn unresponsive_peer_does_not_consume_healthy_peers_lease_budget() {
         let authorized = Arc::new(AtomicBool::new(false));
@@ -211,27 +355,19 @@ mod tests {
                 StatusCode::SERVICE_UNAVAILABLE
             }),
         );
+        let root = tempfile::tempdir().unwrap();
+        let tls = test_tls(root.path(), "127.0.0.1");
+        let mut servers = Vec::new();
         let mut nodes = Vec::new();
         for router in [healthy, unresponsive] {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let server = test_node(&tls, router).await;
             nodes.push(NativeNodePlan {
-                node: format!("http://{}", listener.local_addr().unwrap()),
+                node: server.origin.clone(),
                 operation: None,
             });
-            tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            servers.push(server);
         }
-        let root = tempfile::tempdir().unwrap();
-        let token_file = root.path().join("token");
-        std::fs::write(&token_file, "controller-test-token").unwrap();
-        let config = ControllerConfig {
-            token_file,
-            plan: NativePlan {
-                revision: 1,
-                enabled: true,
-                lease_millis: 5000,
-                nodes,
-            },
-        };
+        let config = test_config(root.path(), tls.certificate_file, nodes);
         let result = tokio::time::timeout(Duration::from_millis(4500), reconcile_once(&config))
             .await
             .expect("unresponsive peer exhausted the renewal budget");

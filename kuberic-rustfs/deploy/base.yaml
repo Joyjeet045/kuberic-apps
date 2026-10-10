@@ -19,7 +19,7 @@ data:
       },
       "state_directory": "/storage/adapter",
       "topology": {
-        "pools": ["http://rfs-a-{0...3}.rustfs-internal:9000/storage/data"],
+        "pools": ["https://rfs-a-{0...3}.rustfs-internal:9000/storage/data"],
         "local_node": null,
         "erasure_set_drive_count": 4
       },
@@ -27,6 +27,11 @@ data:
       "client_address": "0.0.0.0:9002",
       "control_address": "0.0.0.0:9003",
       "control_token_file": "/credentials/control-token",
+      "native_tls": {"directory": "/tls"},
+      "control_tls": {
+        "certificate_file": "/tls/rustfs_cert.pem",
+        "private_key_file": "/tls/rustfs_key.pem"
+      },
       "shutdown_grace_seconds": 10
     }
 ---
@@ -39,15 +44,16 @@ data:
   controller.json: |
     {
       "token_file": "/credentials/control-token",
+      "ca_certificate_file": "/tls/ca.crt",
       "plan": {
         "revision": 1,
         "enabled": true,
         "lease_millis": 10000,
         "nodes": [
-          {"node": "http://rfs-a-0.rustfs-internal:9003", "operation": null},
-          {"node": "http://rfs-a-1.rustfs-internal:9003", "operation": null},
-          {"node": "http://rfs-a-2.rustfs-internal:9003", "operation": null},
-          {"node": "http://rfs-a-3.rustfs-internal:9003", "operation": null}
+          {"node": "https://rfs-a-0.rustfs-internal:9003", "operation": null},
+          {"node": "https://rfs-a-1.rustfs-internal:9003", "operation": null},
+          {"node": "https://rfs-a-2.rustfs-internal:9003", "operation": null},
+          {"node": "https://rfs-a-3.rustfs-internal:9003", "operation": null}
         ]
       }
     }
@@ -131,7 +137,7 @@ spec:
         - name: adapter
           image: kuberic-rustfs:local
           imagePullPolicy: IfNotPresent
-          args: ["serve", "--config", "/config/node.json", "--local-node", "http://$(POD_NAME).rustfs-internal:9000"]
+          args: ["serve", "--config", "/config/node.json", "--local-node", "https://$(POD_NAME).rustfs-internal:9000"]
           env:
             - name: POD_NAME
               valueFrom:
@@ -146,17 +152,28 @@ spec:
               containerPort: 9003
           readinessProbe:
             httpGet:
+              scheme: HTTPS
               path: /ready
               port: control
             periodSeconds: 3
             timeoutSeconds: 5
           livenessProbe:
             httpGet:
+              scheme: HTTPS
               path: /live
               port: control
             initialDelaySeconds: 20
             periodSeconds: 5
             timeoutSeconds: 5
+            failureThreshold: 12
+          startupProbe:
+            httpGet:
+              scheme: HTTPS
+              path: /live
+              port: control
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 60
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -180,6 +197,9 @@ spec:
               readOnly: true
             - name: temporary
               mountPath: /tmp
+            - name: tls
+              mountPath: /tls
+              readOnly: true
       volumes:
         - name: config
           configMap:
@@ -190,6 +210,17 @@ spec:
             defaultMode: 0440
         - name: temporary
           emptyDir: {}
+        - name: tls
+          secret:
+            secretName: rustfs-tls
+            defaultMode: 0440
+            items:
+              - key: tls.crt
+                path: rustfs_cert.pem
+              - key: tls.key
+                path: rustfs_key.pem
+              - key: ca.crt
+                path: ca.crt
   volumeClaimTemplates:
     - metadata:
         name: storage
@@ -248,6 +279,9 @@ spec:
             - name: credentials
               mountPath: /credentials
               readOnly: true
+            - name: tls
+              mountPath: /tls
+              readOnly: true
       volumes:
         - name: config
           configMap:
@@ -259,6 +293,13 @@ spec:
             items:
               - key: control-token
                 path: control-token
+        - name: tls
+          secret:
+            secretName: rustfs-tls
+            defaultMode: 0440
+            items:
+              - key: ca.crt
+                path: ca.crt
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

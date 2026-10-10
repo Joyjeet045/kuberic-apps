@@ -7,11 +7,11 @@ COPY kuberic-page ./kuberic-page
 COPY kuberic-rocksdb ./kuberic-rocksdb
 COPY kuberic-rustfs/Cargo.toml ./kuberic-rustfs/Cargo.toml
 COPY kuberic-rustfs/src ./kuberic-rustfs/src
-COPY kuberic-rustfs/tests/adapter.rs ./kuberic-rustfs/tests/adapter.rs
+COPY kuberic-rustfs/tests ./kuberic-rustfs/tests
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \
-    cargo test --locked -p kuberic-rustfs --lib -- --test-threads=2 \
+    cargo test --locked -p kuberic-rustfs -- --test-threads=2 \
     && mkdir -p /build/native-tests \
     && cargo test --locked -p kuberic-rustfs --lib --no-run --message-format=json > /tmp/lib-tests.json \
     && cp "$(jq -r 'select(.profile.test and .target.kind == ["lib"]) | .executable // empty' /tmp/lib-tests.json)" /build/native-tests/ownership \

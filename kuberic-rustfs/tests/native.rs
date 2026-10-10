@@ -68,6 +68,7 @@ async fn pinned_native_process_starts_stops_and_reopens_existing_storage() -> Re
             erasure_set_drive_count: None,
         },
         address,
+        native_tls: None,
         shutdown_grace: Duration::from_secs(3),
     };
     let health = HealthClient::new(&format!("http://{address}"), Duration::from_secs(2))?;
