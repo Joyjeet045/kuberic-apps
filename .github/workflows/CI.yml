@@ -60,8 +60,7 @@ jobs:
       - name: Install pinned kind
         run: |
           curl --fail --location --output "$RUNNER_TEMP/kind" https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64
-          checksum=$(curl --fail --location https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64.sha256 | awk '{print $1}')
-          printf '%s  %s\n' "$checksum" "$RUNNER_TEMP/kind" | sha256sum --check
+          printf '%s  %s\n' aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d "$RUNNER_TEMP/kind" | sha256sum --check
           chmod +x "$RUNNER_TEMP/kind"
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
 
