@@ -355,6 +355,54 @@ pub(crate) fn prepare_expansion(directory: &Path, target: &Topology) -> Result<(
     validate_expansion(&previous, target)?;
     let lease = TopologyLease::acquire(directory, &previous)?;
     let volumes = expansion_volumes(&lease.directory, &previous, target)?;
+    persist_topology(&lease.directory, target, volumes)
+}
+
+pub(crate) fn validate_retirement(
+    previous: &Topology,
+    target: &Topology,
+    pool: usize,
+) -> Result<()> {
+    previous.local_volumes()?;
+    target.local_volumes()?;
+    ensure!(
+        pool < previous.pools.len()
+            && previous.pools.len() == target.pools.len() + 1
+            && previous
+                .pools
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != pool)
+                .map(|(_, pool)| pool)
+                .eq(&target.pools)
+            && previous.local_node == target.local_node
+            && previous.erasure_set_drive_count == target.erasure_set_drive_count,
+        "retirement must remove exactly the completed pool and preserve surviving identities"
+    );
+    Ok(())
+}
+
+pub(crate) fn prepare_retirement(
+    directory: &Path,
+    previous: &Topology,
+    target: &Topology,
+    pool: usize,
+) -> Result<()> {
+    validate_retirement(previous, target, pool)?;
+    ensure!(
+        recorded_topology(directory)?.as_ref() == Some(previous),
+        "retirement source does not match the recorded topology"
+    );
+    let lease = TopologyLease::acquire(directory, previous)?;
+    let volumes = target
+        .local_volumes()?
+        .iter()
+        .map(|path| existing_directory(path))
+        .collect::<Result<Vec<_>>>()?;
+    persist_topology(&lease.directory, target, volumes)
+}
+
+fn persist_topology(directory: &Path, target: &Topology, volumes: Vec<PathBuf>) -> Result<()> {
     let record = Record {
         schema_version: 1,
         topology: target.clone(),
@@ -365,11 +413,11 @@ pub(crate) fn prepare_expansion(directory: &Path, target: &Topology) -> Result<(
         bytes.len() <= MAX_RECORD_BYTES,
         "topology record exceeds 64 KiB"
     );
-    let mut temporary = tempfile::NamedTempFile::new_in(&lease.directory)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
     temporary.write_all(&bytes)?;
     temporary.as_file().sync_all()?;
-    temporary.persist(lease.directory.join(RECORD))?;
-    sync_directory(&lease.directory)
+    temporary.persist(directory.join(RECORD))?;
+    sync_directory(directory)
 }
 
 pub(crate) fn expansion_volumes(
@@ -437,6 +485,48 @@ mod tests {
             local_node: None,
             erasure_set_drive_count: Some(2),
         }
+    }
+
+    #[test]
+    fn retirement_rejects_unproved_pool_removal_and_survivor_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let previous = Topology {
+            pools: vec![
+                format!("{}{{1...2}}", root.path().join("data").display()),
+                format!("{}{{3...4}}", root.path().join("data").display()),
+                format!("{}{{5...6}}", root.path().join("data").display()),
+            ],
+            local_node: None,
+            erasure_set_drive_count: Some(2),
+        };
+        let mut target = previous.clone();
+        target.pools.remove(1);
+        validate_retirement(&previous, &target, 1).unwrap();
+        assert!(validate_retirement(&previous, &target, 0).is_err());
+        assert!(validate_retirement(&previous, &target, 3).is_err());
+        assert!(validate_retirement(&previous, &previous, 1).is_err());
+        let mut changed = target.clone();
+        changed.pools.reverse();
+        assert!(validate_retirement(&previous, &changed, 1).is_err());
+        changed = target.clone();
+        changed.pools.remove(0);
+        assert!(validate_retirement(&previous, &changed, 1).is_err());
+        changed = target;
+        changed.erasure_set_drive_count = None;
+        assert!(validate_retirement(&previous, &changed, 1).is_err());
+        let distributed = Topology {
+            pools: vec![
+                "http://a{0...3}:9000/data".into(),
+                "http://b{0...3}:9000/data".into(),
+            ],
+            local_node: Some("http://a0:9000".into()),
+            erasure_set_drive_count: Some(4),
+        };
+        let survivor = Topology {
+            pools: distributed.pools[1..].to_vec(),
+            ..distributed.clone()
+        };
+        assert!(validate_retirement(&distributed, &survivor, 0).is_err());
     }
 
     #[test]

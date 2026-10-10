@@ -114,12 +114,12 @@ function Topology([string]$Pod, [string[]]$Pools) {
     return @{ pools = $Pools; local_node = "http://$Pod.rustfs-internal:9000"; erasure_set_drive_count = 4 }
 }
 
-function Set-Plan([long]$Revision, [string[]]$Pods, [hashtable]$Operations = @{}) {
+function Set-Plan([long]$Revision, [string[]]$Pods, [hashtable]$Operations = @{}, [bool]$Enabled = $true) {
     $nodes = @($Pods | ForEach-Object {
         @{ node = "http://$_.rustfs-internal:9003"; operation = $Operations[$_] }
     })
     $config = @{ token_file = "/credentials/control-token"; plan = @{
-        revision = $Revision; enabled = $true; lease_millis = 10000; nodes = $nodes
+        revision = $Revision; enabled = $Enabled; lease_millis = 10000; nodes = $nodes
     }}
     $path = Join-Path $root "controller.json"
     $config | ConvertTo-Json -Depth 30 | Set-Content -Encoding utf8NoBOM $path
@@ -128,11 +128,11 @@ function Set-Plan([long]$Revision, [string[]]$Pods, [hashtable]$Operations = @{}
     if ($LASTEXITCODE -ne 0) { throw "Controller plan update failed" }
 }
 
-function Await-Plan([long]$Revision, [string[]]$Pods, [int]$Seconds = 240) {
+function Await-Plan([long]$Revision, [string[]]$Pods, [int]$Seconds = 240, [bool]$Enabled = $true) {
     Wait-For "native plan $Revision" {
         foreach ($pod in $Pods) {
             $observed = Observe $pod
-            if ($observed.revision -ne (2 * $Revision + 1) -or -not $observed.accepting_clients) { return $false }
+            if ($observed.revision -ne (2 * $Revision + 1) -or $observed.accepting_clients -ne $Enabled) { return $false }
         }
         return $true
     } $Seconds
@@ -164,6 +164,14 @@ function Operation-Status([string]$Pod, [hashtable]$Operation) {
     $result = Http $forwards[$Pod].Control "/v1/native/operation/status" "POST" ($Operation | ConvertTo-Json -Depth 30 -Compress) -Control
     Expect-Status $result 200
     return $result.Text | ConvertFrom-Json -AsHashtable
+}
+
+function Decommission-Status([string]$Pod) {
+    $result = Http $forwards[$Pod].Native "/rustfs/admin/v3/decommission/status" -Signed
+    Expect-Status $result 200
+    $pools = @(($result.Text | ConvertFrom-Json -AsHashtable).pools | Where-Object id -eq 0)
+    if ($pools.Count -ne 1) { throw "Native decommission status omitted the requested pool: $($result.Text)" }
+    return $pools[0]
 }
 
 try {
@@ -332,19 +340,33 @@ nodes:
     Inventory "rfs-b-0"
     $operations = @{}
     foreach ($pod in $all) {
-        $operations[$pod] = @{ id = "decommission-4"; request = @{
+        $operations[$pod] = @{ id = "expanded-restart-4"; request = @{
+            kind = "restart"; topology = Topology $pod @($poolA, $poolB)
+        }}
+    }
+    Set-Plan 4 $all $operations
+    Await-Plan 4 $all 300
+    Inventory "rfs-b-0"
+    $operations = @{}
+    foreach ($pod in $all) {
+        $operations[$pod] = @{ id = "decommission-5"; request = @{
             kind = "decommission"; topology = Topology $pod @($poolA, $poolB); pool = 0
         }}
     }
     $decommissionPid = Native-Pid "rfs-a-0"
-    Set-Plan 4 $all $operations
-    Wait-For "decommission is running before interruption" {
-        $r = Http $forwards["rfs-a-0"].Native "/rustfs/admin/v3/decommission/status" -Signed
-        Expect-Status $r 200
-        $pool = ($r.Text | ConvertFrom-Json -AsHashtable).pools | Where-Object id -eq 0
-        $pool.status -eq "running" -and $pool.decommissionInfo.objectsDecommissioned -gt 0 -and
-            $pool.decommissionInfo.objectsDecommissioned -lt $ObjectCount
+    Set-Plan 5 $all $operations
+    $script:movement = $null
+    Wait-For "native decommission inventory movement or terminal outcome" {
+        $script:movement = Decommission-Status "rfs-a-0"
+        $script:movement.status -in @("failed", "canceled", "complete") -or
+            ($script:movement.status -eq "running" -and
+                $script:movement.decommissionInfo.bucket -eq "inventory" -and
+                $script:movement.decommissionInfo.bytesDecommissioned -ge $payload.Length -and
+                $script:movement.decommissionInfo.objectsDecommissioned -lt $ObjectCount)
     } 120
+    if ($movement.status -ne "running") {
+        throw "Native decommission did not provide interruptible inventory movement: $($movement | ConvertTo-Json -Depth 30 -Compress)"
+    }
     Signal-Native "rfs-a-0" $decommissionPid "STOP"
     if ((Operation-Status "rfs-a-0" $operations["rfs-a-0"]).state -ne "pending") {
         throw "Decommission completed before its participant could be interrupted"
@@ -356,7 +378,37 @@ nodes:
         $pod.metadata.uid -ne $oldUid -and $pod.status.phase -eq "Running"
     } 180
     $null = Forward "rfs-a-0"
-    Await-Plan 4 $all 360
+    $script:terminal = $null
+    Wait-For "interrupted native decommission reaches a terminal outcome" {
+        $script:terminal = Decommission-Status "rfs-a-0"
+        $script:terminal.status -in @("complete", "failed", "canceled")
+    } 360
+    if ($terminal.status -eq "failed" -and $terminal.decommissionInfo.unresolvedEntries.Count -gt 0) {
+        Write-Host "Native unresolved-entry failure requires explicit operator recovery: $($terminal | ConvertTo-Json -Depth 30 -Compress)"
+        foreach ($pod in $all) {
+            if ((Observe $pod).accepting_clients -or (Operation-Status $pod $operations[$pod]).state -ne "pending") {
+                throw "Failed decommission was incorrectly treated as complete on $pod"
+            }
+        }
+        K @("scale", "statefulset/rfs-a", "statefulset/rfs-b", "--replicas=0") | Write-Host
+        K (@("wait", "--for=delete", "--timeout=240s") + @($all | ForEach-Object { "pod/$_" })) | Write-Host
+        K @("scale", "statefulset/rfs-a", "statefulset/rfs-b", "--replicas=4") | Write-Host
+        Wait-For "all interrupted-operation participants return" {
+            $pods = (K @("get", "pods", "-l", "app.kubernetes.io/name=rustfs", "-o", "json") | ConvertFrom-Json).items
+            $pods.Count -eq 8 -and @($pods | Where-Object { $_.status.phase -ne "Running" }).Count -eq 0
+        } 240
+        foreach ($pod in $all) { $null = Forward $pod }
+        K @("wait", "--for=condition=Ready", "pod", "-l", "app.kubernetes.io/name=rustfs", "--timeout=240s") | Write-Host
+        $retry = Decommission-Status "rfs-a-0"
+        if ($retry.status -ne "failed" -or $retry.decommissionInfo.unresolvedEntries.Count -eq 0) {
+            throw "Native unresolved-entry recovery preconditions changed: $($retry | ConvertTo-Json -Depth 30 -Compress)"
+        }
+        Expect-Status (Http $forwards["rfs-a-0"].Native "/rustfs/admin/v3/pools/decommission?pool=0&by-id=true" "POST" -Signed) 200
+    } elseif ($terminal.status -ne "complete") {
+        throw "Native decommission requires a different operator recovery: $($terminal | ConvertTo-Json -Depth 30 -Compress)"
+    }
+    Await-Plan 5 $all 360
+    $decommissionReceipts = @{}
     foreach ($pod in $all) {
         $status = Operation-Status $pod $operations[$pod]
         if ($status.state -ne "complete" -or $status.evidence.status -ne "complete" -or
@@ -364,6 +416,31 @@ nodes:
             $status.evidence.decommissionInfo.objectsDecommissioned -lt $ObjectCount -or
             $status.evidence.decommissionInfo.bytesDecommissioned -lt ($ObjectCount * $payload.Length)) {
             throw "Decommission lacks complete native movement evidence on $pod"
+        }
+        $decommissionReceipts[$pod] = $status | ConvertTo-Json -Depth 30 -Compress
+    }
+    Inventory "rfs-b-1"
+    Set-Plan 6 $all -Enabled $false
+    Await-Plan 6 $all -Enabled $false
+    K @("scale", "statefulset/rfs-a", "--replicas=0") | Write-Host
+    K (@("wait", "--for=delete", "--timeout=240s") + @($podsA | ForEach-Object { "pod/$_" })) | Write-Host
+    $retirements = @{}
+    foreach ($pod in $podsB) {
+        $retirements[$pod] = @{ id = "retire-7"; request = @{
+            kind = "finalizeDecommission"; previous = Topology $pod @($poolA, $poolB)
+            target = Topology $pod @($poolB); decommission_id = "decommission-5"
+        }}
+    }
+    Set-Plan 7 $podsB $retirements
+    Await-Plan 7 $podsB 300
+    foreach ($pod in $podsB) {
+        $status = Operation-Status $pod $retirements[$pod]
+        if ($status.state -ne "complete" -or $status.evidence.poolArguments.Count -ne 1 -or
+            $status.evidence.poolArguments[0] -ne $poolB -or $status.evidence.poolStatus[0] -ne "active") {
+            throw "Retirement did not establish the surviving native pool on $pod"
+        }
+        if ((Operation-Status $pod $operations[$pod] | ConvertTo-Json -Depth 30 -Compress) -ne $decommissionReceipts[$pod]) {
+            throw "Decommission receipt changed after retirement on $pod"
         }
     }
     Inventory "rfs-b-1"
@@ -379,10 +456,10 @@ nodes:
     Native "docker" @("start", $node) | Write-Host
     K @("wait", "--for=condition=Ready", "node/$node", "--timeout=180s") | Write-Host
     K @("wait", "--for=condition=Ready", "pod", "-l", "app.kubernetes.io/name=rustfs", "--timeout=240s") | Write-Host
-    foreach ($pod in $all) {
+    foreach ($pod in $podsB) {
         if ((K @("get", "pod/$pod", "-o", "json") | ConvertFrom-Json).spec.nodeName -eq $node) { $null = Forward $pod }
     }
-    Await-Plan 4 $all
+    Await-Plan 7 $podsB
     Inventory "rfs-b-0"
     $outageObject = Http $forwards["rfs-b-0"].Client "/inventory/worker-outage" -Signed
     Expect-Status $outageObject 200
@@ -397,6 +474,10 @@ nodes:
             $pods = (K @("get", "pods", "-l", "app.kubernetes.io/name=rustfs", "-o", "json") | ConvertFrom-Json).items
             foreach ($pod in $pods) {
                 Write-Host "Diagnostics: $($pod.metadata.name)"
+                if ($forwards.ContainsKey($pod.metadata.name)) {
+                    $status = Http $forwards[$pod.metadata.name].Native "/rustfs/admin/v3/decommission/status" -Signed
+                    Write-Host "Native decommission HTTP $($status.Status): $($status.Text)"
+                }
                 $logs = (K @("logs", $pod.metadata.name, "-c", "adapter", "--tail=2000")) -split "`n" |
                     Where-Object { $_ -notmatch '"event":"http_request_completed"' }
                 $logs | Select-Object -First 30 | Write-Host

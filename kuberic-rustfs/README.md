@@ -207,6 +207,12 @@ Supported operations are:
   omitted by the pinned native response. The adapter retains pool endpoints,
   volumes, and metadata; it does not implement generic replica removal or
   delete decommissioned storage.
+- `finalizeDecommission`: on surviving nodes, remove exactly one completed pool
+  from the native startup arguments. Requires that node's durable `decommission`
+  receipt for the exact previous topology. Remaining pool order, local identity,
+  and erasure width cannot change. Intent is durable before restart, and
+  completion requires the exact surviving pool map, active pools, and readiness.
+  Retired data directories and PVCs are not deleted.
 
 Failed/canceled native decommission remains an explicit pending operation with
 diagnostics; the adapter does not silently restart it or declare success.
@@ -357,22 +363,68 @@ containing all eight node origins:
   `http://rfs-b-{0...3}.rustfs-internal:9000/storage/data`.
 
 Wait for the plan to apply and verify acknowledged objects through a B node.
-To retire pool A, publish another higher revision with a `decommission` request
-on every participant:
+Then publish a higher revision with a same-topology `restart` on all eight
+participants and wait for it to apply. The pinned native implementation can latch
+pool-metadata recovery during expansion; its own distributed tests use a
+coordinated graceful restart after the expanded map has converged. Healthy S3
+reads alone do not prove that native topology mutations are unblocked.
+
+To drain pool A, publish another higher revision with a `decommission` request
+on every participant, for example revision 5:
 
 ```json
-{"id":"decommission-4","request":{"kind":"decommission","topology":{"pools":["http://rfs-a-{0...3}.rustfs-internal:9000/storage/data","http://rfs-b-{0...3}.rustfs-internal:9000/storage/data"],"local_node":"http://rfs-a-0.rustfs-internal:9000","erasure_set_drive_count":4},"pool":0}}
+{"id":"decommission-5","request":{"kind":"decommission","topology":{"pools":["http://rfs-a-{0...3}.rustfs-internal:9000/storage/data","http://rfs-b-{0...3}.rustfs-internal:9000/storage/data"],"local_node":"http://rfs-a-0.rustfs-internal:9000","erasure_set_drive_count":4},"pool":0}}
 ```
 
 Adjust the local origin for each participant. RustFS moves the objects; Kuberic
 does not copy shards. Completion requires native terminal success, not an empty
-pool, elapsed time, or green readiness. Keep all endpoint identities and PVCs,
-including decommissioned ones. This example does not authorize arbitrary
-StatefulSet scale-down, endpoint removal, or deletion of decommissioned storage.
+pool, elapsed time, or green readiness. Keep the full topology and all PVCs
+until every participant has a durable completion receipt. This example does not
+authorize arbitrary StatefulSet scale-down, endpoint removal, or deletion of
+decommissioned storage.
 If a process/Pod restarts, keep its same PVC and bootstrap identity; its journal
 resumes accepted work and preserves receipts. Failed/canceled decommission
 requires investigation through the native admin interface; do not erase the
 journal or format metadata to force an apparent success.
+
+An interrupted native worker can leave a terminal failed attempt, not a resumable
+running attempt. Inspect `GET /rustfs/admin/v3/decommission/status` using signed
+native administration. The adapter must remain pending and client access closed.
+Restore all participants and resolve native metadata/quorum errors first; a
+coordinated Pod restart may be needed to clear a native recovery latch. Keep the
+same PVCs, bootstrap ConfigMaps, and pending controller plan.
+
+For a failed attempt with nonempty `decommissionInfo.unresolvedEntries`, the
+native recovery procedure is an explicit signed
+`POST /rustfs/admin/v3/pools/decommission?pool=0&by-id=true`. RustFS retains its
+progress and re-observes the unresolved entries. This is an operator action,
+not an automatic adapter retry. It can still fail if the underlying cause is
+unresolved. Other failed/canceled states need their own native recovery
+procedure; the example does not clear their metadata automatically. See the
+[pinned native decommission contract](https://github.com/rustfs/rustfs/blob/6de965ae3c965a78ff819fbcd7acd4aa44177d92/docs/architecture/decommission-compatibility.md).
+
+After all decommission receipts are complete, finalize the retired pool before
+testing further restarts: RustFS 1.0.1 rejects startup arguments that still
+contain a completed pool.
+
+1. Publish a higher revision with all eight nodes, `enabled: false`, and no
+   operations. Wait for the disabled plan to apply everywhere.
+2. Stop only the now-decommissioned A StatefulSet, retaining all four PVCs:
+   `kubectl -n rustfs-example scale statefulset/rfs-a --replicas=0`.
+3. Publish another higher revision containing only the four B control origins,
+   with `enabled: true` and a `finalizeDecommission` operation on each node.
+   For B0:
+
+```json
+{"id":"retire-7","request":{"kind":"finalizeDecommission","previous":{"pools":["http://rfs-a-{0...3}.rustfs-internal:9000/storage/data","http://rfs-b-{0...3}.rustfs-internal:9000/storage/data"],"local_node":"http://rfs-b-0.rustfs-internal:9000","erasure_set_drive_count":4},"target":{"pools":["http://rfs-b-{0...3}.rustfs-internal:9000/storage/data"],"local_node":"http://rfs-b-0.rustfs-internal:9000","erasure_set_drive_count":4},"decommission_id":"decommission-5"}}
+```
+
+Adjust both local origins for each B node. Do not use finalization on A nodes:
+they have no surviving local volumes. Wait for native completion on all B nodes,
+then verify the object inventory and surviving-node restart/rejoin behavior.
+Leave bootstrap configuration unchanged; the journal persists the reduced
+desired topology and the original decommission receipts. Do not restart the
+retired A StatefulSet or delete its storage as part of this procedure.
 
 ### Isolated end-to-end suite
 
@@ -390,10 +442,15 @@ docker build --file .\kuberic-rustfs\Dockerfile --tag kuberic-rustfs:local .
 
 The harness checks distinct one-MiB object hashes, authenticated control,
 enforced native/control network isolation, lease expiry, unsafe topology and
-conflicting-ID rejection, native read/write health and S3 quorum outcomes, process and same-PVC
-Pod recovery, stale authority rejection, appended pools, interrupted native
-decommission with measured movement, durable receipts, and worker rejoin.
-It fails if it cannot observe actual in-progress movement before interruption.
+conflicting-ID rejection, native read/write health and S3 quorum outcomes,
+process and same-PVC Pod recovery, stale authority rejection, appended pools,
+coordinated native restart, interrupted native decommission, receipt-verified
+pool retirement, durable receipts, and surviving-worker rejoin.
+It requires actual inventory-bucket movement before interruption, not just
+movement of RustFS's small internal configuration objects. When interruption
+produces a retryable unresolved-entry failure, it checks fail-closed behavior
+and performs one explicit native operator recovery. It never clears native
+metadata to obtain a pass; unresolved failures still fail the suite.
 Quorum fault injection temporarily stops StatefulSet Pods while retaining the
 four-endpoint native configuration and PVCs, then restores all participants.
 This is a temporary outage test, not a supported topology scale-down operation.

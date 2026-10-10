@@ -1,6 +1,6 @@
 use std::fs::{self, File, OpenOptions};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, ensure};
@@ -16,7 +16,8 @@ use tokio::sync::Mutex;
 use crate::admin::AdminClient;
 use crate::journal::Journal;
 use crate::topology::{
-    expansion_volumes, prepare_expansion, recorded_topology, validate_expansion,
+    expansion_volumes, prepare_expansion, prepare_retirement, recorded_topology,
+    validate_expansion, validate_retirement,
 };
 use crate::{
     BinaryPin, CredentialFiles, HealthClient, HealthProbe, HealthStatus, LaunchConfig,
@@ -51,6 +52,11 @@ pub enum TopologyOperation {
     Decommission {
         topology: Topology,
         pool: usize,
+    },
+    FinalizeDecommission {
+        previous: Topology,
+        target: Topology,
+        decommission_id: String,
     },
 }
 
@@ -117,9 +123,7 @@ impl RustfsAdapter {
         if !engine.try_exists()? {
             fs::create_dir(&engine)?;
         }
-        if recorded_topology(&engine)?.is_some_and(|old| old != topology) {
-            prepare_expansion(&engine, &topology)?;
-        }
+        prepare_topology(&engine, &journal, &topology)?;
         let launch = LaunchConfig {
             binary: BinaryPin::new(config.binary.clone(), &config.sha256)?,
             credentials: config.credentials.clone(),
@@ -239,6 +243,19 @@ impl RustfsAdapter {
                 }
                 Some(target)
             }
+            TopologyOperation::FinalizeDecommission {
+                previous,
+                target,
+                decommission_id,
+            } => {
+                let pool = completed_pool(&state.journal, previous, decommission_id)?;
+                validate_retirement(previous, target, pool)?;
+                ensure!(
+                    desired == *previous || desired == *target,
+                    "retirement source does not match the established topology"
+                );
+                Some(target)
+            }
             TopologyOperation::Restart { topology }
             | TopologyOperation::Decommission { topology, .. } => {
                 ensure!(
@@ -269,7 +286,7 @@ impl RustfsAdapter {
             state.process = None;
         }
         if state.config.topology != target {
-            prepare_expansion(&state.config.state_directory, &target)?;
+            prepare_topology(&state.config.state_directory, &state.journal, &target)?;
             state.config.topology = target.clone();
         }
         if state.process.is_none() {
@@ -292,11 +309,18 @@ impl RustfsAdapter {
                 };
                 evidence
             }
-            TopologyOperation::Expand { .. } | TopologyOperation::Restart { .. } => {
+            TopologyOperation::Expand { .. }
+            | TopologyOperation::Restart { .. }
+            | TopologyOperation::FinalizeDecommission { .. } => {
                 if let TopologyOperation::Expand { previous, .. } = &request
                     && pools[previous.pools.len()..]
                         .iter()
                         .any(|pool| pool.status != "active")
+                {
+                    return Ok(NativeOperationStatus::Pending);
+                }
+                if matches!(request, TopologyOperation::FinalizeDecommission { .. })
+                    && pools.iter().any(|pool| pool.status != "active")
                 {
                     return Ok(NativeOperationStatus::Pending);
                 }
@@ -313,6 +337,44 @@ impl RustfsAdapter {
         };
         state.journal.complete(&operation.id, &evidence)?;
         Ok(NativeOperationStatus::Complete { evidence })
+    }
+}
+
+fn completed_pool(journal: &Journal, previous: &Topology, id: &str) -> Result<usize> {
+    let operation = journal.completed_operation(id)?;
+    let TopologyOperation::Decommission { topology, pool } =
+        serde_json::from_value(operation.request)?
+    else {
+        anyhow::bail!("retirement receipt is not for a decommission operation");
+    };
+    ensure!(
+        topology == *previous,
+        "retirement receipt is for a different topology"
+    );
+    Ok(pool)
+}
+
+fn prepare_topology(directory: &Path, journal: &Journal, target: &Topology) -> Result<()> {
+    let Some(recorded) = recorded_topology(directory)?.filter(|old| old != target) else {
+        return Ok(());
+    };
+    let operation = journal
+        .pending()?
+        .context("topology change is missing its durable operation")?;
+    match serde_json::from_value::<TopologyOperation>(operation.request)? {
+        TopologyOperation::Expand {
+            previous,
+            target: requested,
+        } if previous == recorded && requested == *target => prepare_expansion(directory, target),
+        TopologyOperation::FinalizeDecommission {
+            previous,
+            target: requested,
+            decommission_id,
+        } if previous == recorded && requested == *target => {
+            let pool = completed_pool(journal, &previous, &decommission_id)?;
+            prepare_retirement(directory, &previous, target, pool)
+        }
+        _ => anyhow::bail!("recorded topology does not match the durable transition"),
     }
 }
 
@@ -368,5 +430,97 @@ impl NativeApplication for RustfsAdapter {
             state.process = None;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::topology::TopologyLease;
+
+    #[test]
+    fn retirement_requires_matching_completion_and_recovers_without_deleting_storage() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = root.path().join("engine");
+        fs::create_dir(&engine).unwrap();
+        for index in 1..=4 {
+            fs::create_dir(root.path().join(format!("data{index}"))).unwrap();
+        }
+        let previous = Topology {
+            pools: vec![
+                format!("{}{{1...2}}", root.path().join("data").display()),
+                format!("{}{{3...4}}", root.path().join("data").display()),
+            ],
+            local_node: None,
+            erasure_set_drive_count: Some(2),
+        };
+        let target = Topology {
+            pools: previous.pools[1..].to_vec(),
+            ..previous.clone()
+        };
+        drop(TopologyLease::acquire(&engine, &previous).unwrap());
+        let retired_data = root.path().join("data1").join("sentinel");
+        let surviving_data = root.path().join("data3").join("sentinel");
+        fs::write(&retired_data, b"retained").unwrap();
+        fs::write(&surviving_data, b"surviving").unwrap();
+        let path = root.path().join("adapter.sqlite");
+        let mut journal = Journal::open(&path, &previous).unwrap();
+        let decommission = NativeOperation {
+            id: "drain".into(),
+            request: serde_json::to_value(TopologyOperation::Decommission {
+                topology: previous.clone(),
+                pool: 0,
+            })
+            .unwrap(),
+        };
+        assert!(completed_pool(&journal, &previous, &decommission.id).is_err());
+        journal.accept(&decommission, None).unwrap();
+        assert!(completed_pool(&journal, &previous, &decommission.id).is_err());
+        let evidence = json!({"status": "complete", "poolStatus": "decommissioned"});
+        journal.complete(&decommission.id, &evidence).unwrap();
+        assert_eq!(
+            completed_pool(&journal, &previous, &decommission.id).unwrap(),
+            0
+        );
+        assert!(completed_pool(&journal, &target, &decommission.id).is_err());
+        let restart = NativeOperation {
+            id: "restart".into(),
+            request: serde_json::to_value(TopologyOperation::Restart {
+                topology: previous.clone(),
+            })
+            .unwrap(),
+        };
+        journal.accept(&restart, None).unwrap();
+        journal
+            .complete(&restart.id, &json!({"nodeReady": true}))
+            .unwrap();
+        assert!(completed_pool(&journal, &previous, &restart.id).is_err());
+        let finalize = NativeOperation {
+            id: "retire".into(),
+            request: serde_json::to_value(TopologyOperation::FinalizeDecommission {
+                previous: previous.clone(),
+                target: target.clone(),
+                decommission_id: decommission.id.clone(),
+            })
+            .unwrap(),
+        };
+        journal.accept(&finalize, Some(&target)).unwrap();
+        let lease = TopologyLease::acquire(&engine, &previous).unwrap();
+        assert!(prepare_topology(&engine, &journal, &target).is_err());
+        assert_eq!(recorded_topology(&engine).unwrap(), Some(previous.clone()));
+        drop(lease);
+        drop(journal);
+        let journal = Journal::open(&path, &previous).unwrap();
+        prepare_topology(&engine, &journal, &target).unwrap();
+        prepare_topology(&engine, &journal, &target).unwrap();
+        assert_eq!(recorded_topology(&engine).unwrap(), Some(target.clone()));
+        drop(TopologyLease::acquire(&engine, &target).unwrap());
+        assert_eq!(journal.pending().unwrap(), Some(finalize));
+        assert_eq!(
+            journal.lookup(&decommission).unwrap(),
+            Some(NativeOperationStatus::Complete { evidence })
+        );
+        assert_eq!(fs::read(retired_data).unwrap(), b"retained");
+        assert_eq!(fs::read(surviving_data).unwrap(), b"surviving");
     }
 }
