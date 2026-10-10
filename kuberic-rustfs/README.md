@@ -374,8 +374,11 @@ topology mutations are unblocked. For this maintenance restart:
    before restoring both to four replicas. Retain every PVC and bootstrap
    ConfigMap. This guarantees an all-stopped barrier, unlike independent
    per-node `restart` operations.
-3. Wait for all native nodes to be ready, then publish another higher revision
-   with all eight nodes, no operations, and `enabled: true`.
+3. Wait for native `health.ready` in the authenticated observation on every
+   node, while confirming `accepting_clients` remains false. Do not wait for
+   Kubernetes Pod readiness here: the adapter's `/ready` deliberately also
+   requires client authority. Then publish another higher revision with all
+   eight nodes, no operations, and `enabled: true`.
 4. Verify native read/write health and all acknowledged objects through a B node.
 
 To drain pool A, publish another higher revision with a `decommission` request

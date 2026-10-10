@@ -183,7 +183,14 @@ function Restart-Expanded-Pods([string[]]$Pods) {
         $current.Count -eq $Pods.Count -and @($current | Where-Object { $_.status.phase -ne "Running" }).Count -eq 0
     } 240
     foreach ($pod in $Pods) { $null = Forward $pod }
-    K @("wait", "--for=condition=Ready", "pod", "-l", "app.kubernetes.io/name=rustfs", "--timeout=240s") | Write-Host
+    Wait-For "native readiness returns while client access stays fenced" {
+        foreach ($pod in $Pods) {
+            $observed = Observe $pod
+            if ($observed.accepting_clients) { throw "Maintenance unexpectedly opened client access on $pod" }
+            if ($observed.health.state -ne "observed" -or -not $observed.health.health.ready) { return $false }
+        }
+        $true
+    } 240
 }
 
 try {
