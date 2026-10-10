@@ -102,20 +102,26 @@ impl Journal {
         )?)
     }
 
-    pub(crate) fn completed_operation(&self, id: &str) -> Result<NativeOperation> {
-        let request: String = self
+    pub(crate) fn completed_operation(
+        &self,
+        id: &str,
+    ) -> Result<(NativeOperation, serde_json::Value)> {
+        let (request, evidence): (String, String) = self
             .0
             .query_row(
-                "SELECT request FROM operations WHERE id = ?1 AND evidence IS NOT NULL",
+                "SELECT request, evidence FROM operations WHERE id = ?1 AND evidence IS NOT NULL",
                 [id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?
             .context("pool retirement requires a durable local completion receipt")?;
-        Ok(NativeOperation {
-            id: id.to_owned(),
-            request: serde_json::from_str(&request)?,
-        })
+        Ok((
+            NativeOperation {
+                id: id.to_owned(),
+                request: serde_json::from_str(&request)?,
+            },
+            serde_json::from_str(&evidence)?,
+        ))
     }
 
     pub(crate) fn record_launch(&self, id: &str) -> Result<()> {

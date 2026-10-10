@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::Mutex;
 
-use crate::admin::AdminClient;
+use crate::admin::{AdminClient, validate_decommission_receipt};
 use crate::journal::Journal;
 use crate::topology::{
     expansion_volumes, prepare_expansion, prepare_retirement, recorded_topology,
@@ -341,7 +341,7 @@ impl RustfsAdapter {
 }
 
 fn completed_pool(journal: &Journal, previous: &Topology, id: &str) -> Result<usize> {
-    let operation = journal.completed_operation(id)?;
+    let (operation, evidence) = journal.completed_operation(id)?;
     let TopologyOperation::Decommission { topology, pool } =
         serde_json::from_value(operation.request)?
     else {
@@ -350,6 +350,15 @@ fn completed_pool(journal: &Journal, previous: &Topology, id: &str) -> Result<us
     ensure!(
         topology == *previous,
         "retirement receipt is for a different topology"
+    );
+    validate_decommission_receipt(&evidence)?;
+    ensure!(
+        evidence.get("id").and_then(serde_json::Value::as_u64) == Some(pool as u64)
+            && previous.pools.get(pool).is_some_and(|cmdline| {
+                evidence.get("cmdline").and_then(serde_json::Value::as_str)
+                    == Some(cmdline.as_str())
+            }),
+        "native retirement evidence does not identify the completed pool"
     );
     Ok(pool)
 }
@@ -476,7 +485,14 @@ mod tests {
         assert!(completed_pool(&journal, &previous, &decommission.id).is_err());
         journal.accept(&decommission, None).unwrap();
         assert!(completed_pool(&journal, &previous, &decommission.id).is_err());
-        let evidence = json!({"status": "complete", "poolStatus": "decommissioned"});
+        let evidence = json!({
+            "id": 0, "cmdline": previous.pools[0],
+            "status": "complete", "poolStatus": "decommissioned",
+            "decommissionInfo": {
+                "complete": true, "failed": false, "canceled": false,
+                "objectsDecommissionedFailed": 0, "bytesDecommissionedFailed": 0
+            }
+        });
         journal.complete(&decommission.id, &evidence).unwrap();
         assert_eq!(
             completed_pool(&journal, &previous, &decommission.id).unwrap(),
@@ -495,6 +511,24 @@ mod tests {
             .complete(&restart.id, &json!({"nodeReady": true}))
             .unwrap();
         assert!(completed_pool(&journal, &previous, &restart.id).is_err());
+        let malformed = NativeOperation {
+            id: "malformed".into(),
+            request: decommission.request.clone(),
+        };
+        journal.accept(&malformed, None).unwrap();
+        journal
+            .complete(&malformed.id, &json!({"status": "complete"}))
+            .unwrap();
+        assert!(completed_pool(&journal, &previous, &malformed.id).is_err());
+        let wrong_pool = NativeOperation {
+            id: "wrong-pool".into(),
+            request: decommission.request.clone(),
+        };
+        let mut wrong_evidence = evidence.clone();
+        wrong_evidence["cmdline"] = json!(previous.pools[1]);
+        journal.accept(&wrong_pool, None).unwrap();
+        journal.complete(&wrong_pool.id, &wrong_evidence).unwrap();
+        assert!(completed_pool(&journal, &previous, &wrong_pool.id).is_err());
         let finalize = NativeOperation {
             id: "retire".into(),
             request: serde_json::to_value(TopologyOperation::FinalizeDecommission {

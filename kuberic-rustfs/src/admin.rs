@@ -138,6 +138,14 @@ enum DecommissionState {
     Complete,
 }
 
+pub(crate) fn validate_decommission_receipt(entry: &Value) -> Result<()> {
+    ensure!(
+        decommission_state(entry)? == DecommissionState::Complete,
+        "decommission receipt does not contain native terminal success"
+    );
+    Ok(())
+}
+
 fn decommission_state(entry: &Value) -> Result<DecommissionState> {
     let status = entry
         .get("status")
