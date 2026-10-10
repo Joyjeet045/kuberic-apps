@@ -174,6 +174,18 @@ function Decommission-Status([string]$Pod) {
     return $pools[0]
 }
 
+function Restart-Expanded-Pods([string[]]$Pods) {
+    K @("scale", "statefulset/rfs-a", "statefulset/rfs-b", "--replicas=0") | Write-Host
+    K (@("wait", "--for=delete", "--timeout=240s") + @($Pods | ForEach-Object { "pod/$_" })) | Write-Host
+    K @("scale", "statefulset/rfs-a", "statefulset/rfs-b", "--replicas=4") | Write-Host
+    Wait-For "all expanded participants return after coordinated shutdown" {
+        $current = (K @("get", "pods", "-l", "app.kubernetes.io/name=rustfs", "-o", "json") | ConvertFrom-Json).items
+        $current.Count -eq $Pods.Count -and @($current | Where-Object { $_.status.phase -ne "Running" }).Count -eq 0
+    } 240
+    foreach ($pod in $Pods) { $null = Forward $pod }
+    K @("wait", "--for=condition=Ready", "pod", "-l", "app.kubernetes.io/name=rustfs", "--timeout=240s") | Write-Host
+}
+
 try {
     Native $Kind @("version") | Write-Host
     Native "docker" @("image", "inspect", $Image, "--format", "{{.Id}}") | Write-Host
@@ -337,24 +349,29 @@ nodes:
     }
     Set-Plan 3 $all $operations
     Await-Plan 3 $all 300
+    K @("wait", "--for=condition=Ready", "pod", "-l", "app.kubernetes.io/name=rustfs", "--timeout=240s") | Write-Host
+    Set-Plan 4 $all -Enabled $false
+    Await-Plan 4 $all -Enabled $false
+    Restart-Expanded-Pods $all
+    Set-Plan 5 $all
+    Await-Plan 5 $all
+    Wait-For "expanded native cluster read/write health" {
+        foreach ($pod in $all) {
+            $observed = Observe $pod
+            if ($observed.health.state -ne "observed" -or -not $observed.health.health.ready -or
+                -not $observed.health.health.readable -or -not $observed.health.health.writable) { return $false }
+        }
+        $true
+    } 120
     Inventory "rfs-b-0"
     $operations = @{}
     foreach ($pod in $all) {
-        $operations[$pod] = @{ id = "expanded-restart-4"; request = @{
-            kind = "restart"; topology = Topology $pod @($poolA, $poolB)
-        }}
-    }
-    Set-Plan 4 $all $operations
-    Await-Plan 4 $all 300
-    Inventory "rfs-b-0"
-    $operations = @{}
-    foreach ($pod in $all) {
-        $operations[$pod] = @{ id = "decommission-5"; request = @{
+        $operations[$pod] = @{ id = "decommission-6"; request = @{
             kind = "decommission"; topology = Topology $pod @($poolA, $poolB); pool = 0
         }}
     }
     $decommissionPid = Native-Pid "rfs-a-0"
-    Set-Plan 5 $all $operations
+    Set-Plan 6 $all $operations
     $script:movement = $null
     Wait-For "native decommission inventory movement or terminal outcome" {
         $script:movement = Decommission-Status "rfs-a-0"
@@ -390,15 +407,7 @@ nodes:
                 throw "Failed decommission was incorrectly treated as complete on $pod"
             }
         }
-        K @("scale", "statefulset/rfs-a", "statefulset/rfs-b", "--replicas=0") | Write-Host
-        K (@("wait", "--for=delete", "--timeout=240s") + @($all | ForEach-Object { "pod/$_" })) | Write-Host
-        K @("scale", "statefulset/rfs-a", "statefulset/rfs-b", "--replicas=4") | Write-Host
-        Wait-For "all interrupted-operation participants return" {
-            $pods = (K @("get", "pods", "-l", "app.kubernetes.io/name=rustfs", "-o", "json") | ConvertFrom-Json).items
-            $pods.Count -eq 8 -and @($pods | Where-Object { $_.status.phase -ne "Running" }).Count -eq 0
-        } 240
-        foreach ($pod in $all) { $null = Forward $pod }
-        K @("wait", "--for=condition=Ready", "pod", "-l", "app.kubernetes.io/name=rustfs", "--timeout=240s") | Write-Host
+        Restart-Expanded-Pods $all
         $retry = Decommission-Status "rfs-a-0"
         if ($retry.status -ne "failed" -or $retry.decommissionInfo.unresolvedEntries.Count -eq 0) {
             throw "Native unresolved-entry recovery preconditions changed: $($retry | ConvertTo-Json -Depth 30 -Compress)"
@@ -407,7 +416,7 @@ nodes:
     } elseif ($terminal.status -ne "complete") {
         throw "Native decommission requires a different operator recovery: $($terminal | ConvertTo-Json -Depth 30 -Compress)"
     }
-    Await-Plan 5 $all 360
+    Await-Plan 6 $all 360
     $decommissionReceipts = @{}
     foreach ($pod in $all) {
         $status = Operation-Status $pod $operations[$pod]
@@ -420,19 +429,19 @@ nodes:
         $decommissionReceipts[$pod] = $status | ConvertTo-Json -Depth 30 -Compress
     }
     Inventory "rfs-b-1"
-    Set-Plan 6 $all -Enabled $false
-    Await-Plan 6 $all -Enabled $false
+    Set-Plan 7 $all -Enabled $false
+    Await-Plan 7 $all -Enabled $false
     K @("scale", "statefulset/rfs-a", "--replicas=0") | Write-Host
     K (@("wait", "--for=delete", "--timeout=240s") + @($podsA | ForEach-Object { "pod/$_" })) | Write-Host
     $retirements = @{}
     foreach ($pod in $podsB) {
-        $retirements[$pod] = @{ id = "retire-7"; request = @{
+        $retirements[$pod] = @{ id = "retire-8"; request = @{
             kind = "finalizeDecommission"; previous = Topology $pod @($poolA, $poolB)
-            target = Topology $pod @($poolB); decommission_id = "decommission-5"
+            target = Topology $pod @($poolB); decommission_id = "decommission-6"
         }}
     }
-    Set-Plan 7 $podsB $retirements
-    Await-Plan 7 $podsB 300
+    Set-Plan 8 $podsB $retirements
+    Await-Plan 8 $podsB 300
     foreach ($pod in $podsB) {
         $status = Operation-Status $pod $retirements[$pod]
         if ($status.state -ne "complete" -or $status.evidence.poolArguments.Count -ne 1 -or
@@ -459,7 +468,7 @@ nodes:
     foreach ($pod in $podsB) {
         if ((K @("get", "pod/$pod", "-o", "json") | ConvertFrom-Json).spec.nodeName -eq $node) { $null = Forward $pod }
     }
-    Await-Plan 7 $podsB
+    Await-Plan 8 $podsB
     Inventory "rfs-b-0"
     $outageObject = Http $forwards["rfs-b-0"].Client "/inventory/worker-outage" -Signed
     Expect-Status $outageObject 200

@@ -362,18 +362,27 @@ containing all eight node origins:
 - The ordered target pools are the original A expression followed by
   `http://rfs-b-{0...3}.rustfs-internal:9000/storage/data`.
 
-Wait for the plan to apply and verify acknowledged objects through a B node.
-Then publish a higher revision with a same-topology `restart` on all eight
-participants and wait for it to apply. The pinned native implementation can latch
-pool-metadata recovery during expansion; its own distributed tests use a
-coordinated graceful restart after the expanded map has converged. Healthy S3
-reads alone do not prove that native topology mutations are unblocked.
+Wait for the plan to apply and for native readiness on all eight nodes.
+The pinned native implementation can latch pool-metadata recovery during
+expansion; its own distributed tests use a coordinated graceful restart after
+the expanded map has converged. Healthy S3 reads alone do not prove that native
+topology mutations are unblocked. For this maintenance restart:
+
+1. Publish a higher revision with all eight nodes, no operations, and
+   `enabled: false`; wait for that plan to apply everywhere.
+2. Scale both StatefulSets to zero and wait for all eight Pods to be deleted
+   before restoring both to four replicas. Retain every PVC and bootstrap
+   ConfigMap. This guarantees an all-stopped barrier, unlike independent
+   per-node `restart` operations.
+3. Wait for all native nodes to be ready, then publish another higher revision
+   with all eight nodes, no operations, and `enabled: true`.
+4. Verify native read/write health and all acknowledged objects through a B node.
 
 To drain pool A, publish another higher revision with a `decommission` request
-on every participant, for example revision 5:
+on every participant, for example revision 6:
 
 ```json
-{"id":"decommission-5","request":{"kind":"decommission","topology":{"pools":["http://rfs-a-{0...3}.rustfs-internal:9000/storage/data","http://rfs-b-{0...3}.rustfs-internal:9000/storage/data"],"local_node":"http://rfs-a-0.rustfs-internal:9000","erasure_set_drive_count":4},"pool":0}}
+{"id":"decommission-6","request":{"kind":"decommission","topology":{"pools":["http://rfs-a-{0...3}.rustfs-internal:9000/storage/data","http://rfs-b-{0...3}.rustfs-internal:9000/storage/data"],"local_node":"http://rfs-a-0.rustfs-internal:9000","erasure_set_drive_count":4},"pool":0}}
 ```
 
 Adjust the local origin for each participant. RustFS moves the objects; Kuberic
@@ -416,7 +425,7 @@ contain a completed pool.
    For B0:
 
 ```json
-{"id":"retire-7","request":{"kind":"finalizeDecommission","previous":{"pools":["http://rfs-a-{0...3}.rustfs-internal:9000/storage/data","http://rfs-b-{0...3}.rustfs-internal:9000/storage/data"],"local_node":"http://rfs-b-0.rustfs-internal:9000","erasure_set_drive_count":4},"target":{"pools":["http://rfs-b-{0...3}.rustfs-internal:9000/storage/data"],"local_node":"http://rfs-b-0.rustfs-internal:9000","erasure_set_drive_count":4},"decommission_id":"decommission-5"}}
+{"id":"retire-8","request":{"kind":"finalizeDecommission","previous":{"pools":["http://rfs-a-{0...3}.rustfs-internal:9000/storage/data","http://rfs-b-{0...3}.rustfs-internal:9000/storage/data"],"local_node":"http://rfs-b-0.rustfs-internal:9000","erasure_set_drive_count":4},"target":{"pools":["http://rfs-b-{0...3}.rustfs-internal:9000/storage/data"],"local_node":"http://rfs-b-0.rustfs-internal:9000","erasure_set_drive_count":4},"decommission_id":"decommission-6"}}
 ```
 
 Adjust both local origins for each B node. Do not use finalization on A nodes:
