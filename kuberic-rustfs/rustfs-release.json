@@ -1,0 +1,16 @@
+{
+  "version": "1.0.1",
+  "artifacts": [
+    {
+      "platform": "windows-x86_64",
+      "url": "https://github.com/rustfs/rustfs/releases/download/1.0.1/rustfs-windows-x86_64-v1.0.1.zip",
+      "archive_sha256": "624259622524255d0000131e095f37a11299fd76926aabfd8f831a9dbe6a39f7",
+      "executable_sha256": "ee29f347d31af358286e096ea481477044e0a6cd590706526c13879a400143d7"
+    },
+    {
+      "platform": "linux-x86_64-gnu",
+      "url": "https://github.com/rustfs/rustfs/releases/download/1.0.1/rustfs-linux-x86_64-gnu-v1.0.1.zip",
+      "archive_sha256": "9742e183cb0dfb0d48fa909797af572fe47b7f827569036baa4156e0d3958ee5"
+    }
+  ]
+}

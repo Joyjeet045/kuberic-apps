@@ -7,6 +7,7 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY kuberic-page ./kuberic-page
 COPY kuberic-rocksdb ./kuberic-rocksdb
+COPY kuberic-rustfs ./kuberic-rustfs
 RUN cargo build --locked --release -p kuberic-rocksdb
 
 FROM debian:bookworm-slim
